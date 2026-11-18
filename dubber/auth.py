@@ -25,6 +25,7 @@ import urllib.error
 _APP_DATA = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming")) / "VideoDubber"
 _TOKEN_FILE = _APP_DATA / "token.json"
 _CONFIG_USER_FILE = _APP_DATA / "firebase_config.json"
+_USER_KEYS_FILE = _APP_DATA / "account_gemini_keys.json"
 
 
 def _get_project_root() -> Path:
@@ -150,6 +151,86 @@ def get_current_user() -> Optional[dict]:
     if _admin_bypass_session:
         return {"uid": "admin", "email": "Quản trị viên (Admin)"}
     return _load_token()
+
+
+# ── Per-Account Gemini API Key Storage (Firestore + Local Account Cache) ──────
+def _read_local_keys_map() -> dict:
+    if not _USER_KEYS_FILE.exists():
+        return {}
+    try:
+        data = json.loads(_USER_KEYS_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _write_local_account_key(uid: str, gemini_key: str):
+    if not uid:
+        return
+    _APP_DATA.mkdir(parents=True, exist_ok=True)
+    mp = _read_local_keys_map()
+    mp[uid] = gemini_key.strip()
+    _USER_KEYS_FILE.write_text(json.dumps(mp, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def get_account_gemini_key() -> str:
+    """Return the Gemini API key(s) belonging strictly to the currently logged-in account."""
+    u = get_current_user()
+    if not u or not u.get("uid"):
+        return ""
+    return _read_local_keys_map().get(u["uid"], "").strip()
+
+
+def save_account_gemini_key(gemini_key: str) -> Tuple[bool, str]:
+    """Save Gemini API key(s) tied to the current account (synced to Firestore users/{uid})."""
+    u = get_current_user()
+    if not u or not u.get("uid"):
+        return False, "Chưa đăng nhập tài khoản."
+
+    uid = u["uid"]
+    clean_key = gemini_key.strip()
+    _write_local_account_key(uid, clean_key)
+
+    # Sync to Firebase Firestore if regular authenticated Firebase account
+    if uid != "admin":
+        cfg = get_firebase_config()
+        api_key = cfg.get("apiKey", "")
+        project_id = cfg.get("projectId", "")
+        tok = _load_token() or {}
+        id_token = tok.get("id_token", "")
+        refresh_tok = tok.get("refresh_token", "")
+
+        # Refresh token first to ensure valid auth header
+        if refresh_tok and api_key:
+            fresh_id, fresh_ref, err = _refresh_id_token(refresh_tok, api_key)
+            if not err and fresh_id:
+                id_token = fresh_id
+                _save_token(uid, tok.get("email", ""), fresh_id, fresh_ref)
+
+        if id_token and project_id:
+            doc_url = (
+                f"https://firestore.googleapis.com/v1/projects/{project_id}"
+                f"/databases/(default)/documents/users/{uid}?updateMask.fieldPaths=gemini_api_key"
+            )
+            payload = json.dumps({
+                "fields": {
+                    "gemini_api_key": {"stringValue": clean_key},
+                }
+            }).encode("utf-8")
+            headers = {
+                "Authorization": f"Bearer {id_token}",
+                "Content-Type": "application/json",
+                "User-Agent": "VideoDubber-Desktop",
+            }
+            try:
+                req = urllib.request.Request(doc_url, data=payload, headers=headers, method="PATCH")
+                with urllib.request.urlopen(req, timeout=10):
+                    pass
+                return True, "Đã lưu khóa API Gemini và đồng bộ lên tài khoản thành công!"
+            except Exception:
+                return True, "Đã lưu khóa API Gemini cho tài khoản trên máy này."
+
+    return True, "Đã lưu khóa API Gemini cho phiên tài khoản hiện tại!"
 
 
 # ── REST API Calls ─────────────────────────────────────────────────────────────
@@ -332,6 +413,9 @@ def _check_and_lock_firestore(uid: str, email: str, id_token: str, project_id: s
     fields = doc_data.get("fields", {})
     stored_mid = fields.get("machine_id", {}).get("stringValue", "")
     is_active = fields.get("is_active", {}).get("booleanValue", True)
+    cloud_gemini_key = fields.get("gemini_api_key", {}).get("stringValue", "").strip()
+    if cloud_gemini_key:
+        _write_local_account_key(uid, cloud_gemini_key)
 
     if not is_active:
         return False, "⛔ Tài khoản này đã bị Quản trị viên khóa quyền sử dụng!"

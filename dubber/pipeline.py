@@ -132,27 +132,7 @@ def analyze(video, settings: Settings, cb: Callbacks = None):
     if not segs:
         raise RuntimeError("Không nhận dạng được lời thoại nào trong video")
 
-    # 3. Machine Translation (NLLB-200)
-    p = cb.stage(STAGE_TRANSLATE)
-    src_code = _match_lang_code(detected, fallback=(settings.source_lang if settings.source_lang != "auto" else "en"))
-    if detected not in LANGUAGES and src_code != detected:
-        cb.log(f"Ngôn ngữ '{detected}' được ánh xạ về '{src_code}'")
-    tgt = LANGUAGES.get(settings.target_lang, LANGUAGES["vi"])
-    src_obj = LANGUAGES.get(src_code, LANGUAGES["en"])
-    if src_obj.nllb == tgt.nllb:
-        translations = [s["text"] for s in segs]
-        p(1.0)
-    else:
-        from .translate import translate
-        translations = translate(
-            [s["text"] for s in segs], src_obj.nllb, tgt.nllb,
-            settings.nllb_model, settings.use_gpu, cb.log, p
-        )
-    for s, t in zip(segs, translations):
-        s["translation"] = t
-    cb.check()
-
-    # 4. Speaker Gender / Age / Multi-Character Diarization
+    # 3. Speaker Gender / Age / Multi-Character Diarization (runs BEFORE translation so AI knows speaker roles!)
     p = cb.stage(STAGE_DIARIZE)
     try:
         from .gender import analyze_speakers
@@ -172,6 +152,62 @@ def analyze(video, settings: Settings, cb: Callbacks = None):
             s["speaker"] = "NAM_1"
             s["speaker_label"] = "Nam 1"
     p(1.0)
+    cb.check()
+
+    # 4. Script Translation (Gemini AI High->Low Cascade or Offline NLLB-200)
+    p = cb.stage(STAGE_TRANSLATE)
+    src_code = _match_lang_code(detected, fallback=(settings.source_lang if settings.source_lang != "auto" else "en"))
+    if detected not in LANGUAGES and src_code != detected:
+        cb.log(f"Ngôn ngữ '{detected}' được ánh xạ về '{src_code}'")
+    tgt = LANGUAGES.get(settings.target_lang, LANGUAGES["vi"])
+    src_obj = LANGUAGES.get(src_code, LANGUAGES["en"])
+
+    if src_obj.nllb == tgt.nllb and settings.source_lang == settings.target_lang:
+        translations = [s["text"] for s in segs]
+        p(1.0)
+    elif getattr(settings, "translation_engine", "gemini") == "gemini":
+        from . import auth, gemini_translate
+        acc_key = auth.get_account_gemini_key()
+        if not acc_key:
+            raise RuntimeError(
+                "Bạn đang chọn dịch kịch bản bằng Gemini AI nhưng tài khoản chưa lưu khóa API!\n"
+                "👉 Vui lòng bấm nút '🔑 Gemini API' ở góc trên thanh tiêu đề để nhập khóa API "
+                "(hoặc đổi sang 'NLLB Offline' trong Tùy chỉnh nâng cao)."
+            )
+        try:
+            translations = gemini_translate.translate_script_with_gemini(
+                segments=segs,
+                src_lang_name=src_obj.name,
+                tgt_lang_name=tgt.name,
+                raw_api_keys=acc_key,
+                style_code=getattr(settings, "translation_style", "auto_natural"),
+                custom_notes=getattr(settings, "translation_notes", ""),
+                log=cb.log,
+                progress=p,
+                cancelled=cb.cancelled,
+            )
+        except InterruptedError:
+            raise
+        except Exception as gem_err:
+            if getattr(settings, "gemini_fallback_nllb", True) and "không hợp lệ" not in str(gem_err).lower():
+                cb.log(f"⚠ Gemini AI hết lượt sử dụng ({gem_err}) ➜ Tự động chuyển sang mô hình dự phòng NLLB-200 Offline...")
+                from .translate import translate
+                translations = translate(
+                    [s["text"] for s in segs], src_obj.nllb, tgt.nllb,
+                    settings.nllb_model, settings.use_gpu, cb.log, p
+                )
+            else:
+                raise
+    else:
+        from .translate import translate
+        translations = translate(
+            [s["text"] for s in segs], src_obj.nllb, tgt.nllb,
+            settings.nllb_model, settings.use_gpu, cb.log, p
+        )
+
+    for s, t in zip(segs, translations):
+        s["translation"] = t
+    cb.check()
 
     save_project(video, settings, segs, src_code)
     cb.log(f"✔ Hoàn tất phân tích sau {time.time() - t0:.0f}s. Bạn có thể kiểm tra/sửa lời dịch trước khi xuất.")

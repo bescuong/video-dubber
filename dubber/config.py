@@ -210,6 +210,10 @@ class Settings:
     source_lang: str = "auto"            # "auto" or key of LANGUAGES
     target_lang: str = "vi"
     whisper_model: str = "medium"
+    translation_engine: str = "gemini"   # "gemini" (AI Context Script) | "nllb" (Offline MT)
+    translation_style: str = "auto_natural"  # key of gemini_translate.TRANSLATION_STYLES
+    translation_notes: str = ""          # custom pronoun/glossary instructions
+    gemini_fallback_nllb: bool = True    # fallback to NLLB only if all 8 Gemini models exhaust quota
     nllb_model: str = "facebook/nllb-200-distilled-600M"
     use_gpu: bool = True
     separate_vocals: bool = True         # Demucs: keep background music/effects

@@ -30,7 +30,7 @@ if sys.stdout is None:
 if sys.stderr is None:
     sys.stderr = _SafeStream()
 
-EMBEDDED_APP_VERSION = "2.0.1"
+EMBEDDED_APP_VERSION = "2.1.0"
 
 
 def _boot_hotpatch_if_newer():
@@ -78,7 +78,7 @@ def _boot_hotpatch_if_newer():
 _boot_hotpatch_if_newer()
 
 import dubber  # noqa: F401 - initializes Windows DLL directories first
-from dubber import auth, media, pipeline, updater
+from dubber import auth, gemini_translate, media, pipeline, updater
 from dubber.config import (
     LANGUAGES,
     NLLB_MODELS,
@@ -126,7 +126,7 @@ from PySide6.QtWidgets import (
 )
 
 VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".flv", ".m4v", ".ts"}
-APP_VERSION = "2.0.1"
+APP_VERSION = "2.1.0"
 
 
 def _app_icon() -> QIcon:
@@ -180,6 +180,144 @@ class VoicePreviewWorker(QThread):
             self.done_sig.emit(True, "")
         except Exception as e:
             self.done_sig.emit(False, str(e))
+
+
+class _GeminiTestWorker(QThread):
+    done_sig = Signal(bool, str, list)
+
+    def __init__(self, raw_keys: str):
+        super().__init__()
+        self.raw_keys = raw_keys
+
+    def run(self):
+        ok, msg, models = gemini_translate.test_gemini_api_key(self.raw_keys)
+        self.done_sig.emit(ok, msg, models)
+
+
+class GeminiKeyDialog(QDialog):
+    """Per-account Gemini API Key manager with High-to-Low 8-Model Cascade inspector."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._test_worker: _GeminiTestWorker | None = None
+        self.setWindowTitle("Cấu hình khóa Gemini API (Lưu theo Tài khoản)")
+        self.setFixedSize(560, 470)
+        self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
+        self._build_ui()
+
+    def _build_ui(self):
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(22, 18, 22, 18)
+        lay.setSpacing(10)
+
+        u = auth.get_current_user()
+        email_str = u.get("email", "Chưa xác thực") if u else "Chưa xác thực"
+
+        hdr = QLabel("🔑 Khóa Google Gemini API — Dịch Kịch Bản Chuẩn Văn Phong")
+        hdr.setFont(QFont("Segoe UI", 13, QFont.Bold))
+        hdr.setStyleSheet("color: #111827;")
+        lay.addWidget(hdr)
+
+        acc_lbl = QLabel(f"👤 Đang lưu riêng cho tài khoản: {email_str} (tự đồng bộ theo tài khoản của bạn)")
+        acc_lbl.setStyleSheet("color: #1d4ed8; font-weight: 600; font-size: 12px;")
+        lay.addWidget(acc_lbl)
+
+        cascade_info = QLabel(
+            "Thứ tự ưu tiên Model tự động từ Cao ➜ Thấp (tự nhảy sang model kế tiếp nếu hết lượt):\n"
+            "1. Gemini 4 Hydrogen  ➔  2. Gemini 3.8 Flash  ➔  3. Gemini 3.6 Flash  ➔  4. Gemini 3 Flash\n"
+            "➔  5. Gemini 3.5 Flash Lite  ➔  6. Gemini 3.1 Flash Lite  ➔  7. Gemini 2.5 Flash  ➔  8. Gemini 2.5 Flash Lite"
+        )
+        cascade_info.setWordWrap(True)
+        cascade_info.setStyleSheet(
+            "background: #f3f4f6; color: #374151; border: 1px solid #e5e7eb; "
+            "border-radius: 6px; padding: 8px 10px; font-size: 11px;"
+        )
+        lay.addWidget(cascade_info)
+
+        lbl_input = QLabel("Nhập khóa Gemini API (có thể nhập nhiều khóa, mỗi khóa 1 dòng để tăng hạn mức):")
+        lbl_input.setStyleSheet("font-weight: bold; font-size: 12px;")
+        lay.addWidget(lbl_input)
+
+        self.txt_keys = QPlainTextEdit()
+        self.txt_keys.setPlaceholderText("AIzaSy...\n(Mỗi dòng 1 khóa Gemini API lấy từ aistudio.google.com/apikey)")
+        self.txt_keys.setPlainText(auth.get_account_gemini_key())
+        self.txt_keys.setMaximumHeight(95)
+        self.txt_keys.setFont(QFont("Consolas", 10))
+        lay.addWidget(self.txt_keys)
+
+        self.txt_status = QPlainTextEdit()
+        self.txt_status.setReadOnly(True)
+        self.txt_status.setPlaceholderText("Bấm '🧪 Kiểm tra kết nối' để xác nhận khóa API và danh sách Model khả dụng...")
+        self.txt_status.setStyleSheet("background: #f9fafb; font-family: Consolas; font-size: 11px;")
+        lay.addWidget(self.txt_status, 1)
+
+        btn_row = QHBoxLayout()
+        btn_get_key = QPushButton("🌐 Lấy khóa API miễn phí")
+        btn_get_key.setCursor(Qt.PointingHandCursor)
+        btn_get_key.clicked.connect(self._open_ai_studio)
+
+        self.btn_test = QPushButton("🧪 Kiểm tra kết nối")
+        self.btn_test.setCursor(Qt.PointingHandCursor)
+        self.btn_test.clicked.connect(self._run_test)
+
+        self.btn_save = QPushButton("💾 Lưu khóa theo tài khoản")
+        self.btn_save.setCursor(Qt.PointingHandCursor)
+        self.btn_save.setStyleSheet(
+            "QPushButton { background-color: #16a34a; color: white; font-weight: bold; padding: 7px 16px; border-radius: 6px; }"
+            "QPushButton:hover { background-color: #15803d; }"
+        )
+        self.btn_save.clicked.connect(self._save_key)
+
+        btn_close = QPushButton("Đóng")
+        btn_close.clicked.connect(self.reject)
+
+        btn_row.addWidget(btn_get_key)
+        btn_row.addWidget(self.btn_test)
+        btn_row.addStretch(1)
+        btn_row.addWidget(btn_close)
+        btn_row.addWidget(self.btn_save)
+        lay.addLayout(btn_row)
+
+    @staticmethod
+    def _open_ai_studio():
+        import webbrowser
+        webbrowser.open("https://aistudio.google.com/apikey")
+
+    def _run_test(self):
+        raw = self.txt_keys.toPlainText().strip()
+        if not raw:
+            QMessageBox.information(self, "Chưa nhập khóa", "Vui lòng dán khóa Gemini API vào ô trước khi kiểm tra.")
+            return
+        self.btn_test.setEnabled(False)
+        self.btn_test.setText("⏳ Đang kiểm tra...")
+        self.txt_status.setPlainText("Đang kết nối tới Google AI Studio và kiểm tra thứ tự Model...")
+
+        self._test_worker = _GeminiTestWorker(raw)
+        self._test_worker.done_sig.connect(self._on_test_done)
+        self._test_worker.start()
+
+    def _on_test_done(self, ok: bool, msg: str, models: list):
+        self.btn_test.setEnabled(True)
+        self.btn_test.setText("🧪 Kiểm tra kết nối")
+        lines = [msg]
+        if models:
+            lines.append("\nDanh sách Model có lượt sử dụng đã sẵn sàng (Cao ➜ Thấp):")
+            lines.extend(f"  {m}" for m in models)
+        self.txt_status.setPlainText("\n".join(lines))
+
+    def _save_key(self):
+        raw = self.txt_keys.toPlainText().strip()
+        if raw and not gemini_translate.parse_api_keys(raw):
+            QMessageBox.warning(self, "Khóa không hợp lệ", "Định dạng khóa API quá ngắn hoặc không hợp lệ.")
+            return
+        self.btn_save.setEnabled(False)
+        ok, msg = auth.save_account_gemini_key(raw)
+        self.btn_save.setEnabled(True)
+        if ok:
+            QMessageBox.information(self, "Đã lưu khóa API", msg)
+            self.accept()
+        else:
+            QMessageBox.warning(self, "Lỗi lưu khóa", msg)
 
 
 class PipelineWorker(QThread):
@@ -246,8 +384,8 @@ class BatchWorker(QThread):
     _WEIGHTS = {
         pipeline.STAGE_SEPARATE: (0.00, 0.18),
         pipeline.STAGE_ASR: (0.18, 0.18),
-        pipeline.STAGE_TRANSLATE: (0.36, 0.12),
-        pipeline.STAGE_DIARIZE: (0.48, 0.04),
+        pipeline.STAGE_DIARIZE: (0.36, 0.04),
+        pipeline.STAGE_TRANSLATE: (0.40, 0.12),
         pipeline.STAGE_TTS: (0.52, 0.16),
         pipeline.STAGE_MIX: (0.68, 0.02),
         pipeline.STAGE_OCR: (0.70, 0.12),
@@ -333,8 +471,8 @@ class PipelineProgressCard(QFrame):
         "analyze": [
             (pipeline.STAGE_SEPARATE, "1. Tách nhạc", 0.34),
             (pipeline.STAGE_ASR, "2. Nghe thoại", 0.34),
-            (pipeline.STAGE_TRANSLATE, "3. Dịch thuật", 0.24),
-            (pipeline.STAGE_DIARIZE, "4. Phân vai", 0.08),
+            (pipeline.STAGE_DIARIZE, "3. Phân vai", 0.08),
+            (pipeline.STAGE_TRANSLATE, "4. Dịch kịch bản", 0.24),
         ],
         "render": [
             (pipeline.STAGE_TTS, "1. Lồng tiếng", 0.32),
@@ -345,8 +483,8 @@ class PipelineProgressCard(QFrame):
         "both": [
             (pipeline.STAGE_SEPARATE, "1. Tách nhạc", 0.18),
             (pipeline.STAGE_ASR, "2. Nghe thoại", 0.18),
-            (pipeline.STAGE_TRANSLATE, "3. Dịch thuật", 0.12),
-            (pipeline.STAGE_DIARIZE, "4. Phân vai", 0.04),
+            (pipeline.STAGE_DIARIZE, "3. Phân vai", 0.04),
+            (pipeline.STAGE_TRANSLATE, "4. Dịch kịch bản", 0.12),
             (pipeline.STAGE_TTS, "5. Lồng tiếng", 0.16),
             (pipeline.STAGE_OCR, "6. Phụ đề OCR", 0.12),
             (pipeline.STAGE_RENDER, "7. Xuất Video", 0.20),
@@ -649,6 +787,7 @@ class MainWindow(QMainWindow):
         self._apply_theme()
         self._setup_tray()
         self._refresh_voice_combo()
+        self._refresh_gemini_badge()
 
         # Live Firebase account heartbeat (every 2.5 minutes) — kicks immediately if disabled on Firebase
         self._auth_timer = QTimer(self)
@@ -683,6 +822,12 @@ class MainWindow(QMainWindow):
         lbl_tag.setStyleSheet("color: #6b7280; font-size: 12px;")
         h_lay.addWidget(lbl_tag)
         h_lay.addStretch(1)
+
+        self.btn_gemini_key = QPushButton("🔑 Gemini API")
+        self.btn_gemini_key.setCursor(Qt.PointingHandCursor)
+        self.btn_gemini_key.setToolTip("Nhập hoặc quản lý khóa Gemini API lưu riêng theo tài khoản")
+        self.btn_gemini_key.clicked.connect(self._open_gemini_key_dialog)
+        h_lay.addWidget(self.btn_gemini_key)
 
         self.btn_check_upd = QPushButton("🔄 Kiểm tra cập nhật")
         self.btn_check_upd.setCursor(Qt.PointingHandCursor)
@@ -754,6 +899,9 @@ class MainWindow(QMainWindow):
         a_quit.triggered.connect(self.close)
 
         m_acc = mb.addMenu("&Tài khoản & Cập nhật")
+        a_gem = m_acc.addAction("🔑 Cấu hình khóa Gemini API (Lưu theo tài khoản)...")
+        a_gem.triggered.connect(self._open_gemini_key_dialog)
+
         a_mid = m_acc.addAction(f"📋 Sao chép Mã máy ({auth.get_short_machine_id()})")
         a_mid.triggered.connect(self._copy_machine_id)
 
@@ -974,6 +1122,20 @@ class MainWindow(QMainWindow):
         lang_row.addWidget(self.cb_tgt, 1)
         lay.addLayout(lang_row)
 
+        # Row 1B: Gemini Script Style & Optional Context/Pronoun Note
+        style_row = QHBoxLayout()
+        self.cb_trans_style = QComboBox()
+        for scode, (stitle, _sdesc) in gemini_translate.TRANSLATION_STYLES.items():
+            self.cb_trans_style.addItem(stitle, scode)
+
+        self.ed_trans_notes = QLineEdit()
+        self.ed_trans_notes.setPlaceholderText("Ghi chú xưng hô/tên riêng (Tùy chọn, VD: Xưng hô Anh - Em, giữ tên John)")
+
+        style_row.addWidget(QLabel("Văn phong dịch:"))
+        style_row.addWidget(self.cb_trans_style, 3)
+        style_row.addWidget(self.ed_trans_notes, 2)
+        lay.addLayout(style_row)
+
         # Row 2: Character / Voice Mode
         mode_row = QHBoxLayout()
         self.cb_voice_mode = QComboBox()
@@ -1112,7 +1274,19 @@ class MainWindow(QMainWindow):
         aud_row.addWidget(self.sp_speed)
         form.addRow("Nhịp & Âm lượng:", aud_row)
 
-        # AI Models & Hardware
+        # AI Models & Translation Engine
+        eng_row = QHBoxLayout()
+        self.cb_trans_engine = QComboBox()
+        self.cb_trans_engine.addItem("✨ Gemini AI (Dịch kịch bản chuẩn văn phong - Đề xuất)", "gemini")
+        self.cb_trans_engine.addItem("💻 NLLB-200 Offline (Dịch máy cục bộ không cần API)", "nllb")
+
+        self.chk_gem_fallback = QCheckBox("Dự phòng NLLB nếu hết lượt Gemini")
+        self.chk_gem_fallback.setChecked(True)
+
+        eng_row.addWidget(self.cb_trans_engine, 1)
+        eng_row.addWidget(self.chk_gem_fallback)
+        form.addRow("Bộ máy dịch:", eng_row)
+
         mdl_row = QHBoxLayout()
         self.cb_whisper = QComboBox()
         for m in WHISPER_MODELS:
@@ -1128,10 +1302,10 @@ class MainWindow(QMainWindow):
 
         mdl_row.addWidget(QLabel("Whisper:"))
         mdl_row.addWidget(self.cb_whisper)
-        mdl_row.addWidget(QLabel("Dịch:"))
+        mdl_row.addWidget(QLabel("NLLB:"))
         mdl_row.addWidget(self.cb_nllb, 1)
         mdl_row.addWidget(self.chk_gpu)
-        form.addRow("Mô hình AI:", mdl_row)
+        form.addRow("Mô hình Offline:", mdl_row)
 
     # ------------------------------------------------------------------ Tab 2: Batch Queue
     def _build_batch_tab(self, parent: QWidget):
@@ -1383,6 +1557,43 @@ class MainWindow(QMainWindow):
         mid = auth.get_short_machine_id()
         QApplication.clipboard().setText(mid)
         QMessageBox.information(self, "Mã thiết bị", f"Đã sao chép Mã thiết bị vào bộ nhớ tạm:\n\n{mid}")
+
+    def _refresh_gemini_badge(self):
+        has_key = bool(gemini_translate.parse_api_keys(auth.get_account_gemini_key()))
+        if has_key:
+            self.btn_gemini_key.setText("🔑 Gemini API: Đã lưu")
+            self.btn_gemini_key.setStyleSheet(
+                "QPushButton { background: #dcfce7; color: #15803d; border: 1px solid #86efac; "
+                "padding: 5px 12px; border-radius: 6px; font-weight: bold; font-size: 12px; }"
+                "QPushButton:hover { background: #bbf7d0; }"
+            )
+        else:
+            self.btn_gemini_key.setText("🔑 Nhập Gemini API")
+            self.btn_gemini_key.setStyleSheet(
+                "QPushButton { background: #fffbeb; color: #b45309; border: 1px solid #fde68a; "
+                "padding: 5px 12px; border-radius: 6px; font-weight: bold; font-size: 12px; }"
+                "QPushButton:hover { background: #fef3c7; }"
+            )
+
+    def _open_gemini_key_dialog(self) -> bool:
+        dlg = GeminiKeyDialog(self)
+        res = dlg.exec() == QDialog.Accepted
+        self._refresh_gemini_badge()
+        return res
+
+    def _ensure_gemini_key_if_needed(self, settings: Settings, will_translate: bool) -> bool:
+        if not will_translate or settings.translation_engine != "gemini":
+            return True
+        if gemini_translate.parse_api_keys(auth.get_account_gemini_key()):
+            return True
+        QMessageBox.information(
+            self,
+            "Cần nhập khóa Gemini API",
+            "Bạn đang chọn dịch kịch bản chuẩn văn phong bằng Gemini AI.\n"
+            "Vui lòng nhập khóa Gemini API của bạn (khóa sẽ được tự động lưu theo tài khoản).",
+        )
+        self._open_gemini_key_dialog()
+        return bool(gemini_translate.parse_api_keys(auth.get_account_gemini_key()))
 
     def _check_updates(self, silent: bool = False):
         if self._pending_update_info and self._pending_update_info.get("has_update") and not silent:
@@ -1685,6 +1896,10 @@ class MainWindow(QMainWindow):
             source_lang=self.cb_src.currentData(),
             target_lang=self.cb_tgt.currentData(),
             whisper_model=self.cb_whisper.currentData(),
+            translation_engine=self.cb_trans_engine.currentData(),
+            translation_style=self.cb_trans_style.currentData(),
+            translation_notes=self.ed_trans_notes.text().strip(),
+            gemini_fallback_nllb=self.chk_gem_fallback.isChecked(),
             nllb_model=self.cb_nllb.currentData(),
             use_gpu=self.chk_gpu.isChecked(),
             separate_vocals=self.chk_demucs.isChecked(),
@@ -1727,6 +1942,8 @@ class MainWindow(QMainWindow):
                 return
 
         settings = self._collect_settings()
+        if not self._ensure_gemini_key_if_needed(settings, will_translate=(mode in ("analyze", "both"))):
+            return
         out_path = self.ed_output.text().strip() or None
         self._set_running_ui(True)
         self._was_cancelled = False
@@ -1881,6 +2098,8 @@ class MainWindow(QMainWindow):
                 prog.setValue(0)
 
         settings = self._collect_settings()
+        if not self._ensure_gemini_key_if_needed(settings, will_translate=True):
+            return
         out_dir = self.ed_batch_out.text().strip()
 
         self.btn_batch_start.setEnabled(False)
