@@ -1,0 +1,19 @@
+# Python & Venv
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Build & Installer Artifacts
+build/
+dist/
+Output/
+*_dub/
+
+# Local Secrets (keep public config only)
+admin_github_secret.json
+token.json
+
+# Models & Large Binaries (tracked via Releases, not git source)
+models/
+bin/*.exe
