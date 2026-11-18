@@ -30,7 +30,7 @@ if sys.stdout is None:
 if sys.stderr is None:
     sys.stderr = _SafeStream()
 
-EMBEDDED_APP_VERSION = "2.0.0"
+EMBEDDED_APP_VERSION = "2.0.1"
 
 
 def _boot_hotpatch_if_newer():
@@ -126,7 +126,7 @@ from PySide6.QtWidgets import (
 )
 
 VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".flv", ".m4v", ".ts"}
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.0.1"
 
 
 def _app_icon() -> QIcon:

@@ -7,7 +7,7 @@ import numpy as np
 
 
 def _load_demucs_model():
-    # 1. Try local models folder (next to package or next to executable)
+    # 1. Try local models folder (next to executable or package)
     for base in [
         Path(sys.executable).parent,
         Path(__file__).parent.parent,
@@ -44,6 +44,19 @@ def _load_demucs_model():
     return model
 
 
+def _get_segment_samples(model) -> float:
+    """Safely extract segment window length in samples for both HTDemucs and BagOfModels."""
+    seg_sec = getattr(model, "segment", None)
+    if seg_sec is None and hasattr(model, "models") and len(model.models) > 0:
+        seg_sec = getattr(model.models[0], "segment", None)
+    if seg_sec is None:
+        max_seg = getattr(model, "max_allowed_segment", None)
+        if max_seg and max_seg != float("inf"):
+            seg_sec = max_seg
+    sr = float(getattr(model, "samplerate", 44100) or 44100)
+    return float(seg_sec or 7.8) * sr
+
+
 def separate(audio, log=print, use_gpu=True, progress=None, cancelled=None):
     """audio: float32 (2, n) at 44.1 kHz. Returns (vocals, background), same shape."""
     class _SafeStream:
@@ -72,6 +85,7 @@ def separate(audio, log=print, use_gpu=True, progress=None, cancelled=None):
     device = "cuda" if use_gpu and torch.cuda.is_available() else "cpu"
     wav = torch.from_numpy(audio)
     total_len = max(1, wav.shape[-1])
+    seg_samples = _get_segment_samples(model)
     ref = wav.mean(0)
     mean, std = ref.mean(), ref.std() + 1e-8
     wav_n = (wav - mean) / std
@@ -80,10 +94,12 @@ def separate(audio, log=print, use_gpu=True, progress=None, cancelled=None):
         if cancelled and cancelled():
             raise InterruptedError("Đã hủy")
         if progress and isinstance(info_dict, dict) and info_dict.get("state") == "end":
-            off = float(info_dict.get("segment_offset", 0))
-            seg_samples = float((model.segment or 7.8) * model.samplerate)
-            frac = min(0.98, (off + seg_samples) / total_len)
-            progress(frac)
+            try:
+                off = float(info_dict.get("segment_offset", 0))
+                frac = min(0.98, (off + seg_samples) / total_len)
+                progress(frac)
+            except Exception:
+                pass
 
     def _run(dev):
         log(f"Demucs đang tách giọng & nhạc nền trên {dev.upper()}...")

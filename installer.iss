@@ -1,6 +1,6 @@
 ; Inno Setup Script for Video Dubber
 #define MyAppName "Video Dubber"
-#define MyAppVersion "2.0.0"
+#define MyAppVersion "2.0.1"
 #define MyAppPublisher "AI Video Tools"
 #define MyAppExeName "VideoDubber.exe"
 
