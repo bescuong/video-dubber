@@ -1,5 +1,6 @@
 {
   "version": "2.0.1",
   "repo": "bescuong/video-dubber",
-  "notes": "Bản cập nhật v2.0.1:\n- Sửa lỗi tương thích BagOfModels.segment khi tách nhạc nền Demucs trên CUDA.\n- Tối ưu theo dõi tiến trình tách âm thanh."
+  "notes": "Bản cập nhật v2.0.1:\n- Sửa lỗi tương thích BagOfModels.segment khi tách nhạc nền Demucs trên CUDA.\n- Tối ưu theo dõi tiến trình tách âm thanh.",
+  "hotpatch_url": "https://github.com/bescuong/video-dubber/releases/download/v2.0.1/VideoDubber_HotPatch_v2.0.1.zip"
 }
