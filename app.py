@@ -30,7 +30,7 @@ if sys.stdout is None:
 if sys.stderr is None:
     sys.stderr = _SafeStream()
 
-EMBEDDED_APP_VERSION = "2.4.0"
+EMBEDDED_APP_VERSION = "2.5.0"
 
 
 def _boot_hotpatch_if_newer():
@@ -126,7 +126,7 @@ from PySide6.QtWidgets import (
 )
 
 VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".flv", ".m4v", ".ts"}
-APP_VERSION = "2.4.0"
+APP_VERSION = "2.5.0"
 
 
 def _app_icon() -> QIcon:
@@ -1384,10 +1384,18 @@ class MainWindow(QMainWindow):
         btn_add_row.clicked.connect(self._add_segment_row)
         btn_del_row = QPushButton("➖ Xóa dòng chọn")
         btn_del_row.clicked.connect(self._del_segment_row)
+        btn_all_male = QPushButton("👨 Đưa tất cả về Nam 1")
+        btn_all_male.setToolTip("Gộp toàn bộ các câu trong bảng về 1 vai Nam 1 duy nhất")
+        btn_all_male.clicked.connect(lambda: self._bulk_set_role("NAM_1"))
+        btn_all_female = QPushButton("👩 Đưa tất cả về Nữ 1")
+        btn_all_female.setToolTip("Gộp toàn bộ các câu trong bảng về 1 vai Nữ 1 duy nhất")
+        btn_all_female.clicked.connect(lambda: self._bulk_set_role("NU_1"))
         btn_save_proj = QPushButton("💾 Lưu chỉnh sửa")
         btn_save_proj.clicked.connect(self._save_edits)
         tbl_btns.addWidget(btn_add_row)
         tbl_btns.addWidget(btn_del_row)
+        tbl_btns.addWidget(btn_all_male)
+        tbl_btns.addWidget(btn_all_female)
         tbl_btns.addWidget(btn_save_proj)
         tbl_btns.addStretch(1)
         tbl_v.addLayout(tbl_btns)
@@ -1711,16 +1719,16 @@ class MainWindow(QMainWindow):
         self.sp_orig_vol.setValue(0.0)
 
         self.sp_gap_ms = QSpinBox()
-        self.sp_gap_ms.setRange(80, 400)
+        self.sp_gap_ms.setRange(100, 600)
         self.sp_gap_ms.setSingleStep(20)
         self.sp_gap_ms.setSuffix(" ms")
-        self.sp_gap_ms.setValue(150)
-        self.sp_gap_ms.setToolTip("Khoảng nghỉ tự nhiên giữa 2 câu liên tiếp để chống dính chữ")
+        self.sp_gap_ms.setValue(240)
+        self.sp_gap_ms.setToolTip("Khoảng nghỉ tự nhiên giữa 2 câu liên tiếp để chống dính chữ (khuyên dùng 240 ms)")
 
         self.sp_speed = QDoubleSpinBox()
-        self.sp_speed.setRange(1.0, 2.0)
-        self.sp_speed.setSingleStep(0.05)
-        self.sp_speed.setValue(1.50)
+        self.sp_speed.setRange(1.0, 1.8)
+        self.sp_speed.setSingleStep(0.04)
+        self.sp_speed.setValue(1.28)
 
         aud_row.addWidget(QLabel("Âm lồng:"))
         aud_row.addWidget(self.sp_dub_vol)
@@ -1981,7 +1989,7 @@ class MainWindow(QMainWindow):
         self.w_omni_box.setVisible(is_omni)
         self.w_edge_box.setVisible(not is_omni)
         if is_omni:
-            preset = self.cb_omni_preset.currentData() or "clone_auto"
+            preset = self.cb_omni_preset.currentData() or "design_auto"
             self.w_omni_ref_row.setVisible(preset == "clone_file")
 
     def _browse_omni_ref(self):
@@ -2000,7 +2008,7 @@ class MainWindow(QMainWindow):
         sample_txt = SAMPLE_PREVIEW_TEXT.get(lang_code, SAMPLE_PREVIEW_TEXT["en"])
 
         if eng == "omnivoice":
-            preset = self.cb_omni_preset.currentData() or "clone_auto"
+            preset = self.cb_omni_preset.currentData() or "design_auto"
             ref_path = self.ed_omni_ref.text().strip()
             if preset == "clone_file" and (not ref_path or not os.path.isfile(ref_path)):
                 QMessageBox.information(
@@ -2475,6 +2483,21 @@ class MainWindow(QMainWindow):
         for r in rows:
             self.table.removeRow(r)
 
+    def _bulk_set_role(self, spk_code: str):
+        count = 0
+        for r in range(self.table.rowCount()):
+            cb = self.table.cellWidget(r, 2)
+            if isinstance(cb, QComboBox):
+                for i in range(cb.count()):
+                    meta = cb.itemData(i)
+                    if isinstance(meta, tuple) and len(meta) >= 4 and meta[1] == spk_code and meta[3] == "auto":
+                        cb.setCurrentIndex(i)
+                        count += 1
+                        break
+        if count:
+            lbl = "Nam 1" if spk_code == "NAM_1" else "Nữ 1"
+            self._log(f"🔁 Đã đồng bộ toàn bộ {count} câu thoại về cùng 1 vai [{lbl}].")
+
     def _save_edits(self):
         if not self.video_path:
             return
@@ -2514,7 +2537,7 @@ class MainWindow(QMainWindow):
             max_speedup=float(self.sp_speed.value()),
             min_gap_ms=int(self.sp_gap_ms.value()),
             tts_engine=self.cb_tts_engine.currentData() or "omnivoice",
-            omnivoice_preset=self.cb_omni_preset.currentData() or "clone_auto",
+            omnivoice_preset=self.cb_omni_preset.currentData() or "design_auto",
             omnivoice_ref_audio=self.ed_omni_ref.text().strip(),
             omnivoice_steps=int(self.cb_omni_steps.currentData() or 16),
             voice_mode=self.cb_voice_mode.currentData(),

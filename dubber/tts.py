@@ -266,14 +266,18 @@ def compute_elastic_budgets(segs: list[dict], nat_durs: list[float], total_durat
 
 
 def place_audios_on_track(segs: list[dict], audios: list[np.ndarray], speeds: list[float],
-                          total_duration: float, min_gap_ms: int = 150):
+                          total_duration: float, min_gap_ms: int = 240):
     """Place per-segment 44.1kHz mono audio clips onto final dub track with guaranteed breath pauses.
 
-    Writes 'dub_start' and 'dub_end' onto each segment dict so subtitles match spoken audio 1:1.
+    Anti-Slur v2.5 Guarantees:
+    - Enforces at least `min_gap_ms` (default 240ms) clean silence between EVERY pair of sentences.
+    - Caps secondary `_atempo` at <= 1.10x (never crushes syllables into fast-forward gibberish).
+    - Allows smooth elastic forward drift into upcoming natural pauses instead of chopping words mid-sentence!
+    - Writes exact 'dub_start' and 'dub_end' back onto each segment dict so subtitles match 1:1.
     """
-    n_total = int((total_duration + 1.5) * SR)
+    n_total = int((total_duration + 2.5) * SR)
     track = np.zeros(n_total, np.float32)
-    min_gap = max(0.08, float(min_gap_ms) / 1000.0)
+    min_gap = max(0.14, float(min_gap_ms) / 1000.0)
 
     info = []
     cursor = 0.0  # earliest allowed start time (in seconds) for next sentence
@@ -290,27 +294,29 @@ def place_audios_on_track(segs: list[dict], audios: list[np.ndarray], speeds: li
             continue
 
         actual_start = max(orig_start, cursor)
+        # Measure natural window from original slot (plus gentle 0.55s elastic cushion), NOT penalized by prior drift!
+        natural_window = max(0.40, orig_end - orig_start, (next_orig_start - orig_start - min_gap) + 0.55)
         if i + 1 < len(segs):
-            hard_ceil_end = max(actual_start + 0.22, (next_orig_start + 0.36) - min_gap)
+            hard_ceil_end = max(actual_start + 0.40, (next_orig_start + 0.85) - min_gap)
+            avail = max(0.40, min(natural_window, hard_ceil_end - actual_start))
         else:
-            hard_ceil_end = max(actual_start + 0.22, total_duration - 0.03)
+            avail = max(0.40, total_duration + 0.35 - actual_start)
 
-        avail = max(0.22, hard_ceil_end - actual_start)
         dur = len(y) / SR
         stretched = 1.0
 
-        # Gentle secondary time-compression ONLY if still slightly over budget (capped at 1.18x to avoid slurring)
-        if dur > avail * 1.02:
-            stretched = min(dur / avail, 1.18)
+        # Ultra-gentle secondary compression capped strictly at 1.10x so voice NEVER sounds slurred!
+        if dur > avail * 1.04:
+            stretched = min(dur / avail, 1.10)
             y = _atempo(y, stretched)
             dur = len(y) / SR
 
-        # Absolute safety ceiling so it never collides into the next sentence even on extreme 3x text
-        abs_limit_end = (next_orig_start + 0.45 - min_gap * 0.75) if (i + 1 < len(segs)) else (total_duration + 0.2)
-        max_samples = max(int(0.20 * SR), int((abs_limit_end - actual_start) * SR))
-        if len(y) > max_samples:
-            y = y[:max_samples].copy()
-            fo = min(len(y) // 2, int(0.085 * SR))
+        # Only trim cleanly at the very end of the entire video file (never chop mid-video sentences!)
+        video_hard_end = total_duration + 0.35
+        max_end_samples = max(int(0.25 * SR), int((video_hard_end - actual_start) * SR))
+        if len(y) > max_end_samples:
+            y = y[:max_end_samples].copy()
+            fo = min(len(y) // 2, int(0.095 * SR))
             if fo > 4:
                 y[-fo:] *= 0.5 * (1.0 + np.cos(np.linspace(0.0, np.pi, fo, dtype=np.float32)))
             dur = len(y) / SR

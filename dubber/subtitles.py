@@ -893,9 +893,97 @@ def _ass_escape(text: str) -> str:
     return text.replace("\\", "/").replace("{", "(").replace("}", ")").replace("\n", "\\N")
 
 
+_BREAK_CONJ = {
+    "nhưng", "vì", "nên", "mà", "khi", "nếu", "để", "rồi", "và", "hoặc", "thì", "bởi", "còn",
+    "and", "but", "so", "because", "when", "while", "if", "that", "which", "or", "then",
+}
+
+
+def _split_text_chunks(text: str, max_words: int = 11, max_chars: int = 48) -> list[str]:
+    """Recursively split a long sentence into natural breath-sized subtitle phrases."""
+    s = re.sub(r"\s+", " ", text.strip())
+    if not s:
+        return []
+    words = s.split(" ")
+    is_cjk = len(words) <= 2 and len(s) > 18
+    cjk_limit = 20
+
+    if is_cjk:
+        if len(s) <= cjk_limit:
+            return [s]
+        mid = len(s) // 2
+        best_p = -1
+        for off in range(min(9, mid - 3)):
+            for p in (mid + off, mid - off):
+                if 4 <= p <= len(s) - 4 and s[p - 1] in "、，。！？；：,.!?":
+                    best_p = p
+                    break
+            if best_p > 0:
+                break
+        if best_p < 0:
+            best_p = mid
+        return _split_text_chunks(s[:best_p], max_words, max_chars) + _split_text_chunks(s[best_p:], max_words, max_chars)
+
+    if len(words) <= max_words and len(s) <= max_chars:
+        return [s]
+
+    # Score candidate word split positions `i` (left = words[:i], right = words[i:])
+    n = len(words)
+    best_i = max(2, n // 2)
+    best_score = -1e9
+    for i in range(3, n - 2):
+        left_w = words[i - 1]
+        right_w = words[i].lower().strip(".,?!;:—-\"'")
+        balance = 1.0 - abs(i - n / 2.0) / max(1.0, n / 2.0)
+        bonus = 0.0
+        if left_w.endswith((".", "?", "!", ";", ":", "…")):
+            bonus = 1.6
+        elif left_w.endswith((",", "—", "-")):
+            bonus = 1.25
+        elif right_w in _BREAK_CONJ:
+            bonus = 0.75
+        score = balance + bonus
+        if score > best_score:
+            best_score = score
+            best_i = i
+
+    left_str = " ".join(words[:best_i]).strip()
+    right_str = " ".join(words[best_i:]).strip()
+    return _split_text_chunks(left_str, max_words, max_chars) + _split_text_chunks(right_str, max_words, max_chars)
+
+
+def _split_into_rhythm_phrases(raw: str, st: float, en: float) -> list[list]:
+    """Break long subtitle lines into sequential rhythm-synced `[sub_st, sub_en, phrase]` cards."""
+    dur = en - st
+    if dur < 1.75:
+        return [[st, en, raw]]
+    chunks = _split_text_chunks(raw, max_words=11, max_chars=48)
+    if len(chunks) <= 1:
+        return [[st, en, raw]]
+
+    weights = []
+    for c in chunks:
+        w_cnt = len(c.split())
+        base_w = float(max(len(c), w_cnt * 4))
+        if c.endswith((".", "?", "!", ",", ";", ":")):
+            base_w *= 1.12
+        weights.append(max(4.0, base_w))
+
+    tot_w = sum(weights)
+    out = []
+    cur_t = st
+    for idx, (c, w) in enumerate(zip(chunks, weights)):
+        c_dur = dur * (w / tot_w)
+        c_end = en if idx == len(chunks) - 1 else (cur_t + max(0.35, c_dur - 0.03))
+        out.append([cur_t, c_end, c])
+        cur_t = c_end + 0.03
+    return out
+
+
 def _normalized_sub_intervals(segments: list[dict]) -> list[tuple[float, float, str]]:
-    """Extract (start, end, translation) synced to TTS timing (or OCR timing) and strictly prevent overlaps."""
-    items = []
+    """Extract (start, end, translation) synced to TTS timing, split long lines by speaking rhythm,
+    and strictly prevent any screen overlap."""
+    items: list[list] = []
     for s in segments:
         raw = s.get("translation", "").strip()
         if not raw:
@@ -903,11 +991,11 @@ def _normalized_sub_intervals(segments: list[dict]) -> list[tuple[float, float, 
         st = float(s.get("dub_start", s["start"]))
         en = float(s.get("dub_end", s["end"]))
         en = max(st + 0.25, en)
-        items.append([st, en, raw])
+        items.extend(_split_into_rhythm_phrases(raw, st, en))
 
     for i in range(len(items) - 1):
-        if items[i][1] > items[i + 1][0] - 0.04:
-            items[i][1] = max(items[i][0] + 0.15, items[i + 1][0] - 0.04)
+        if items[i][1] > items[i + 1][0] - 0.03:
+            items[i][1] = max(items[i][0] + 0.18, items[i + 1][0] - 0.03)
             if items[i + 1][0] < items[i][1]:
                 items[i + 1][0] = items[i][1] + 0.02
                 items[i + 1][1] = max(items[i + 1][0] + 0.20, items[i + 1][1])

@@ -412,9 +412,10 @@ def _build_dubbing_prompts(
         f"- Đọc toàn bộ đoạn hội thoại và trường 'spk' (nhân vật phát ngôn: Nam 1, Nữ 1, Nam 2, Trẻ em...) "
         f"để xác định chính xác mối quan hệ và KHÓA CHẶT ĐẠI TỪ XƯNG HÔ xuyên suốt 100% các câu, không bao giờ "
         f"để câu trước xưng 'tôi-bạn' câu sau nhảy sang 'anh-em' vô lý.\n"
-        f"- KHỚP ĐỘ DÀI LỒNG TIẾNG (Cực kỳ quan trọng): Mỗi câu có trường 'dur' (thời lượng nói tính bằng giây). "
-        f"Hãy gọt giũa câu dịch cô đọng, giàu nhịp điệu để đọc ở tốc độ bình thường vừa khít thời lượng 'dur' "
-        f"(tránh dịch lê thê dài gấp đôi câu gốc làm giọng đọc bị tua nhanh hoặc dính chữ).\n"
+        f"- KHỚP ĐỘ DÀI CHỐNG DÍNH CHỮ (Cực kỳ quan trọng): Mỗi câu có trường 'dur' (giây) và 'max_w' "
+        f"(số từ/âm tiết tối đa có thể đọc rõ ràng ở tốc độ bình thường). Hãy gọt giũa câu dịch cô đọng, súc tích, "
+        f"TUYỆT ĐỐI KHÔNG vượt quá 'max_w' từ (ví dụ max_w=6 thì chỉ dịch 4–6 từ thật tự nhiên) để giọng đọc "
+        f"thong thả, tròn vành rõ chữ 100%, không bị tua nhanh hay dính chữ.\n"
         f"- Giữ nguyên đúng số lượng câu và mã số 'id' của từng câu. Không gộp câu, không bỏ sót bất kỳ 'id' nào.\n"
     )
     if custom_notes.strip():
@@ -533,12 +534,18 @@ def translate_script_with_gemini(
         batch_payload = []
         for idx in range(start_i, end_i):
             s = segments[idx]
-            dur = round(max(0.3, float(s["end"]) - float(s["start"])), 1)
+            st_t = float(s["start"])
+            en_t = float(s["end"])
+            dur = round(max(0.3, en_t - st_t), 1)
+            next_st = float(segments[idx + 1]["start"]) if (idx + 1 < total) else (en_t + 0.6)
+            slot_sec = max(dur, min(dur + 0.45, next_st - st_t - 0.24))
+            max_w = max(3, int(round(slot_sec * 3.9)))
             spk = s.get("speaker_label") or ("Nữ" if s.get("gender") == "female" else "Nam")
             batch_payload.append({
                 "id": idx,
                 "spk": spk,
                 "dur": dur,
+                "max_w": max_w,
                 "src": s["text"].strip(),
             })
 

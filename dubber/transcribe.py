@@ -21,8 +21,8 @@ def _add_cuda_dlls():
         pass
 
 
-def _split_words(words, max_len=7.5):
-    """Split a long whisper segment at natural sentence/clause punctuation or largest breath pause."""
+def _split_words(words, max_len=4.5):
+    """Split a long whisper segment at natural sentence/clause punctuation or breath pauses (~2.0..4.5s)."""
     if not words:
         return []
 
@@ -37,13 +37,13 @@ def _split_words(words, max_len=7.5):
         gap_after = (words[idx + 1].start - w.end) if (idx + 1 < len(words)) else 9.9
 
         # 1. Clean sentence-ending punctuation
-        if dur >= 1.8 and txt.endswith(SENT_END_PUNCT):
+        if dur >= 1.2 and txt.endswith(SENT_END_PUNCT):
             pieces.append(cur)
             cur = []
             continue
 
-        # 2. Clause punctuation or clear natural breath pause (> 0.35s)
-        if dur >= 3.8 and (txt.endswith(CLAUSE_PUNCT) or gap_after >= 0.35):
+        # 2. Clause punctuation or clear natural breath pause (> 0.26s)
+        if dur >= 2.2 and (txt.endswith(CLAUSE_PUNCT) or gap_after >= 0.26):
             pieces.append(cur)
             cur = []
             continue
@@ -162,8 +162,8 @@ def transcribe(wav16k_path, model_name="medium", language=None, use_gpu=True, lo
     log(f"Ngôn ngữ nguồn: {info.language} (độ tin cậy {info.language_probability:.2f})")
     raw_out = []
     for seg in segments_iter:
-        if seg.words and (seg.end - seg.start > 7.5):
-            raw_out.extend(_split_words(seg.words, max_len=7.5))
+        if seg.words and (seg.end - seg.start > 4.2):
+            raw_out.extend(_split_words(seg.words, max_len=4.5))
         else:
             t = seg.text.strip()
             if t:
@@ -173,5 +173,5 @@ def transcribe(wav16k_path, model_name="medium", language=None, use_gpu=True, lo
 
     del model
     gc.collect()
-    out = _clean_and_merge_fragments(raw_out)
+    out = _clean_and_merge_fragments(raw_out, max_merged_dur=4.8)
     return out, info.language

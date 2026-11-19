@@ -220,10 +220,10 @@ class Settings:
     separate_vocals: bool = True         # Demucs: keep background music/effects
     original_vocals_volume: float = 0.0  # 0..1, keep a bit of original voice
     dub_volume: float = 1.05
-    max_speedup: float = 1.50            # max TTS speed-up (lowered from 1.6 to avoid slurring)
-    min_gap_ms: int = 150                # minimum breath pause (ms) between sentences
-    tts_engine: str = "omnivoice"        # "omnivoice" (AI Voice Clone / Design) | "edge" (Microsoft Edge Neural)
-    omnivoice_preset: str = "clone_auto" # key of omnivoice_tts.OMNIVOICE_PRESETS
+    max_speedup: float = 1.28            # crisp anti-slur TTS speed ceiling (<=1.28x keeps every syllable clear)
+    min_gap_ms: int = 240                # natural 240ms breath pause between consecutive sentences
+    tts_engine: str = "omnivoice"        # "omnivoice" | "edge"
+    omnivoice_preset: str = "design_auto" # default native clear voice design (zero foreign clone muffle!)
     omnivoice_ref_audio: str = ""        # custom .wav/.mp3 path when omnivoice_preset == "clone_file"
     omnivoice_steps: int = 16            # OmniVoice diffusion steps: 16 (fast crisp) | 24 (high) | 32 (ultra)
     voice_mode: str = "auto_character"   # auto_character | auto | male | female | custom (Edge TTS)
