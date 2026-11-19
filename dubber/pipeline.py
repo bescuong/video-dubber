@@ -91,68 +91,114 @@ def analyze(video, settings: Settings, cb: Callbacks = None):
     video = str(Path(video).resolve())
     wd = work_dir(video)
     info = media.probe(video)
-    if not info["has_audio"]:
-        raise RuntimeError("Video không có kênh âm thanh")
+    mode = getattr(settings, "process_mode", "dub_audio")
+
+    if mode == "dub_audio" and not info["has_audio"]:
+        cb.log("ℹ Video không có kênh âm thanh — tự động chuyển sang chế độ Quét chữ phụ đề trên video (OCR).")
+        mode = "ocr_sub_only"
+
     cb.log(f"Video {info['width']}x{info['height']} @ {info['fps']:.3f} fps, {info['duration']:.1f}s")
 
-    # 1. Audio extraction & Demucs separation (cached)
-    p = cb.stage(STAGE_SEPARATE)
-    vocals_p, bg_p = wd / "vocals.wav", wd / "background.wav"
-    if settings.separate_vocals:
-        if not (vocals_p.exists() and bg_p.exists()):
-            from .separate import separate
-            audio = media.load_audio(video, SR, 2)
-            p(0.05)
-            cb.check()
-            vocals, bg = separate(
-                audio, log=cb.log, use_gpu=settings.use_gpu,
-                progress=lambda f: p(0.05 + 0.92 * f), cancelled=cb.cancelled
+    if mode in ("ocr_sub_only", "ocr_sub_dub"):
+        # OCR-First Branch: scan burned-in text directly from movable ROI (works on silent or BGM-only videos!)
+        p = cb.stage(STAGE_OCR)
+        from . import subtitles
+        acc_key = ""
+        if getattr(settings, "translation_engine", "gemini") == "gemini":
+            try:
+                from . import auth
+                acc_key = auth.get_account_gemini_key()
+            except Exception:
+                acc_key = ""
+
+        segs, samples, detected = subtitles.extract_ocr_subtitles(
+            video,
+            info,
+            settings,
+            gemini_api_key=acc_key,
+            log=cb.log,
+            progress=p,
+            cancelled=cb.cancelled,
+        )
+        # Cache OCR detection boxes so Stage 2 (render) erases old subs immediately without rescanning
+        try:
+            cache = wd / "ocr_subs.json"
+            cache.write_text(
+                json.dumps({"key": subtitles.roi_cache_key(settings), "samples": samples}),
+                encoding="utf-8",
             )
-            media.save_wav(vocals_p, vocals, SR)
-            media.save_wav(bg_p, bg, SR)
-        else:
-            cb.log("Dùng lại kết quả tách giọng & nhạc nền đã lưu")
-        asr_src = vocals_p
+        except Exception:
+            pass
+        p(1.0)
+        cb.check()
+        if not segs:
+            raise RuntimeError(
+                "Không quét thấy văn bản phụ đề nào trong khung chọn!\n"
+                "👉 Hãy kéo khung màu xanh trên màn hình xem trước đặt đúng vào vùng chứa phụ đề gốc rồi thử lại."
+            )
     else:
-        asr_src = video
-    p(1.0)
-    cb.check()
+        # 1. Audio extraction & Demucs separation (cached)
+        p = cb.stage(STAGE_SEPARATE)
+        vocals_p, bg_p = wd / "vocals.wav", wd / "background.wav"
+        if settings.separate_vocals:
+            if not (vocals_p.exists() and bg_p.exists()):
+                from .separate import separate
+                audio = media.load_audio(video, SR, 2)
+                p(0.05)
+                cb.check()
+                vocals, bg = separate(
+                    audio, log=cb.log, use_gpu=settings.use_gpu,
+                    progress=lambda f: p(0.05 + 0.92 * f), cancelled=cb.cancelled
+                )
+                media.save_wav(vocals_p, vocals, SR)
+                media.save_wav(bg_p, bg, SR)
+            else:
+                cb.log("Dùng lại kết quả tách giọng & nhạc nền đã lưu")
+            asr_src = vocals_p
+        else:
+            asr_src = video
+        p(1.0)
+        cb.check()
 
-    # 2. Speech recognition (Whisper)
-    p = cb.stage(STAGE_ASR)
-    wav16 = wd / "asr16k.wav"
-    media.run(["ffmpeg", "-v", "error", "-y", "-i", str(asr_src), "-ac", "1", "-ar", "16000", str(wav16)])
-    from .transcribe import transcribe
-    lang = None if settings.source_lang == "auto" else LANGUAGES.get(settings.source_lang, LANGUAGES["en"]).whisper_code
-    segs, detected = transcribe(
-        wav16, settings.whisper_model, lang, settings.use_gpu, cb.log, p, info["duration"]
-    )
-    cb.log(f"Nhận dạng được {len(segs)} câu thoại")
-    cb.check()
-    if not segs:
-        raise RuntimeError("Không nhận dạng được lời thoại nào trong video")
+        # 2. Speech recognition (Whisper)
+        p = cb.stage(STAGE_ASR)
+        wav16 = wd / "asr16k.wav"
+        media.run(["ffmpeg", "-v", "error", "-y", "-i", str(asr_src), "-ac", "1", "-ar", "16000", str(wav16)])
+        from .transcribe import transcribe
+        lang = None if settings.source_lang == "auto" else LANGUAGES.get(settings.source_lang, LANGUAGES["en"]).whisper_code
+        segs, detected = transcribe(
+            wav16, settings.whisper_model, lang, settings.use_gpu, cb.log, p, info["duration"]
+        )
+        cb.log(f"Nhận dạng được {len(segs)} câu thoại")
+        cb.check()
+        if not segs:
+            raise RuntimeError(
+                "Không nhận dạng được lời thoại nào trong video.\n"
+                "👉 Nếu video chỉ có chữ phụ đề hiển thị (không có tiếng nói), hãy đổi 'Chế độ xử lý' "
+                "sang '📝 Chỉ dịch phụ đề chữ trên video (OCR)'."
+            )
 
-    # 3. Speaker Gender / Age / Multi-Character Diarization (runs BEFORE translation so AI knows speaker roles!)
-    p = cb.stage(STAGE_DIARIZE)
-    try:
-        from .gender import analyze_speakers
-        y16 = media.load_audio(wav16, 16000, 1)[0]
-        p(0.3)
-        spk_infos = analyze_speakers(y16, segs)
-        unique_labels = sorted({x["speaker_label"] for x in spk_infos})
-        cb.log(f"Phân tích giọng đọc: phát hiện {len(unique_labels)} nhóm nhân vật ({', '.join(unique_labels)})")
-        for s, sp in zip(segs, spk_infos):
-            s["gender"] = sp["gender"]
-            s["speaker"] = sp["speaker"]
-            s["speaker_label"] = sp["speaker_label"]
-    except Exception as e:
-        cb.log(f"Không phân tích chi tiết được nhân vật ({e}), dùng mặc định Nam")
-        for s in segs:
-            s["gender"] = "male"
-            s["speaker"] = "NAM_1"
-            s["speaker_label"] = "Nam 1"
-    p(1.0)
-    cb.check()
+        # 3. Speaker Gender / Age / Multi-Character Diarization (runs BEFORE translation so AI knows speaker roles!)
+        p = cb.stage(STAGE_DIARIZE)
+        try:
+            from .gender import analyze_speakers
+            y16 = media.load_audio(wav16, 16000, 1)[0]
+            p(0.3)
+            spk_infos = analyze_speakers(y16, segs)
+            unique_labels = sorted({x["speaker_label"] for x in spk_infos})
+            cb.log(f"Phân tích giọng đọc: phát hiện {len(unique_labels)} nhóm nhân vật ({', '.join(unique_labels)})")
+            for s, sp in zip(segs, spk_infos):
+                s["gender"] = sp["gender"]
+                s["speaker"] = sp["speaker"]
+                s["speaker_label"] = sp["speaker_label"]
+        except Exception as e:
+            cb.log(f"Không phân tích chi tiết được nhân vật ({e}), dùng mặc định Nam")
+            for s in segs:
+                s["gender"] = "male"
+                s["speaker"] = "NAM_1"
+                s["speaker_label"] = "Nam 1"
+        p(1.0)
+        cb.check()
 
     # 4. Script Translation (Gemini AI High->Low Cascade or Offline NLLB-200)
     p = cb.stage(STAGE_TRANSLATE)
@@ -223,9 +269,16 @@ def _rms_active(x, thr=0.005):
 def _mix(dub, wd, info, settings, video, cb):
     n = len(dub)
     vocals_p, bg_p = wd / "vocals.wav", wd / "background.wav"
-    if settings.separate_vocals and bg_p.exists():
+    if not info.get("has_audio", True):
+        bg = np.zeros((2, n), np.float32)
+        vocals = np.zeros((2, n), np.float32)
+    elif settings.separate_vocals and bg_p.exists() and vocals_p.exists():
         bg = media.load_audio(bg_p, SR, 2)
         vocals = media.load_audio(vocals_p, SR, 2)
+    elif getattr(settings, "process_mode", "dub_audio") == "ocr_sub_dub":
+        # Keep original background music cleanly when dubbing over OCR text video
+        bg = media.load_audio(video, SR, 2) * 0.55
+        vocals = np.zeros((2, bg.shape[1]), np.float32)
     else:
         bg = np.zeros((2, n), np.float32)
         vocals = media.load_audio(video, SR, 2)
@@ -272,73 +325,89 @@ def render(video, settings: Settings, segments, cb: Callbacks = None, output=Non
     info = media.probe(video)
     W, H = info["width"], info["height"]
     tgt = LANGUAGES.get(settings.target_lang, LANGUAGES["vi"])
+    mode = getattr(settings, "process_mode", "dub_audio")
+    need_tts = mode in ("dub_audio", "ocr_sub_dub")
     save_project(video, settings, segments, (load_project(video) or {}).get("source_lang", "auto"))
 
-    # 1. TTS with OmniVoice AI (Zero-Shot Clone / Voice Design) or Edge Neural TTS + Elastic Timeline
-    p = cb.stage(STAGE_TTS)
-    from .gender import resolve_voice_for_segment
-    from . import omnivoice_tts
-    from .tts import synthesize_track
+    audio_p = None
+    if need_tts:
+        # 1. TTS with OmniVoice AI (Zero-Shot Clone / Voice Design) or Edge Neural TTS + Elastic Timeline
+        p = cb.stage(STAGE_TTS)
+        from .gender import resolve_voice_for_segment
+        from . import omnivoice_tts
+        from .tts import synthesize_track
 
-    for s in segments:
-        s["voice"] = resolve_voice_for_segment(s, settings)
+        for s in segments:
+            s["voice"] = resolve_voice_for_segment(s, settings)
 
-    want_omni = getattr(settings, "tts_engine", "omnivoice") == "omnivoice"
-    if want_omni and not omnivoice_tts.is_omnivoice_available():
-        cb.log(
-            "⚠ Phiên bản cài đặt hiện tại chưa tích hợp gói thư viện OmniVoice AI — "
-            "tự động chuyển sang Edge Neural TTS (vui lòng chạy file Setup v2.2.0 để dùng OmniVoice)."
-        )
-        want_omni = False
+        want_omni = getattr(settings, "tts_engine", "omnivoice") == "omnivoice"
+        if want_omni and not omnivoice_tts.is_omnivoice_available():
+            cb.log(
+                "⚠ Phiên bản cài đặt hiện tại chưa tích hợp gói thư viện OmniVoice AI — "
+                "tự động chuyển sang Edge Neural TTS (vui lòng chạy file Setup v2.3.0 để dùng OmniVoice)."
+            )
+            want_omni = False
 
-    if want_omni:
-        vocals_p = wd / "vocals.wav"
-        ref_src = vocals_p if vocals_p.exists() else video
-        dub, tinfo = omnivoice_tts.synthesize_track_omnivoice(
-            segments,
-            info["duration"],
-            str(wd / "tts_omni"),
-            target_lang=settings.target_lang,
-            vocals_path=ref_src,
-            preset=getattr(settings, "omnivoice_preset", "clone_auto"),
-            ref_audio_path=getattr(settings, "omnivoice_ref_audio", ""),
-            use_gpu=settings.use_gpu,
-            max_speedup=settings.max_speedup,
-            min_gap_ms=getattr(settings, "min_gap_ms", 150),
-            num_step=int(getattr(settings, "omnivoice_steps", 16)),
-            log=cb.log,
-            progress=p,
-            cancelled=cb.cancelled,
-        )
+        if want_omni:
+            vocals_p = wd / "vocals.wav"
+            if vocals_p.exists():
+                ref_src = vocals_p
+            elif info["has_audio"] and mode == "dub_audio":
+                ref_src = video
+            else:
+                ref_src = None
+            dub, tinfo = omnivoice_tts.synthesize_track_omnivoice(
+                segments,
+                info["duration"],
+                str(wd / "tts_omni"),
+                target_lang=settings.target_lang,
+                vocals_path=ref_src,
+                preset=getattr(settings, "omnivoice_preset", "clone_auto"),
+                ref_audio_path=getattr(settings, "omnivoice_ref_audio", ""),
+                use_gpu=settings.use_gpu,
+                max_speedup=settings.max_speedup,
+                min_gap_ms=getattr(settings, "min_gap_ms", 150),
+                num_step=int(getattr(settings, "omnivoice_steps", 16)),
+                log=cb.log,
+                progress=p,
+                cancelled=cb.cancelled,
+            )
+        else:
+            dub, tinfo = synthesize_track(
+                segments,
+                info["duration"],
+                str(wd / "tts"),
+                max_speedup=settings.max_speedup,
+                min_gap_ms=getattr(settings, "min_gap_ms", 150),
+                log=cb.log,
+                progress=p,
+                cancelled=cb.cancelled,
+            )
+        fast = sum(1 for t in tinfo if t["speed"] > settings.max_speedup * 1.05)
+        if fast:
+            cb.log(f"ℹ Có {fast} câu thoại dịch khá dài đã được tự động cân chỉnh giãn nhịp.")
+        cb.check()
+
+        # 2. Mix Audio
+        p = cb.stage(STAGE_MIX)
+        mix = _mix(dub, wd, info, settings, video, cb)
+        audio_p = wd / "dub_audio.wav"
+        media.save_wav(audio_p, mix, SR)
+        p(1.0)
+        cb.check()
     else:
-        dub, tinfo = synthesize_track(
-            segments,
-            info["duration"],
-            str(wd / "tts"),
-            max_speedup=settings.max_speedup,
-            min_gap_ms=getattr(settings, "min_gap_ms", 150),
-            log=cb.log,
-            progress=p,
-            cancelled=cb.cancelled,
-        )
-    fast = sum(1 for t in tinfo if t["speed"] > settings.max_speedup * 1.05)
-    if fast:
-        cb.log(f"ℹ Có {fast} câu thoại dịch khá dài đã được tự động cân chỉnh giãn nhịp.")
-    cb.check()
+        # Subtitle-only mode: keep exact burned-in frame timings (no TTS drift!)
+        for s in segments:
+            s.pop("dub_start", None)
+            s.pop("dub_end", None)
+        cb.log("📝 Chế độ chỉ dịch phụ đề: giữ nguyên âm thanh gốc (hoặc không tiếng), không chèn giọng đọc.")
 
-    # 2. Mix Audio
-    p = cb.stage(STAGE_MIX)
-    mix = _mix(dub, wd, info, settings, video, cb)
-    audio_p = wd / "dub_audio.wav"
-    media.save_wav(audio_p, mix, SR)
-    p(1.0)
-    cb.check()
-
-    # 3. Old Subtitle Detection (OCR)
+    # 3. Old Subtitle Detection (OCR inside movable 4-sided ROI)
     samples = []
     if settings.blur_old_subs or (settings.burn_new_subs and settings.sub_place_on_old):
         p = cb.stage(STAGE_OCR)
-        key = f"v2_{settings.sub_region_top:.3f}_{settings.sub_region_bottom:.3f}_{settings.ocr_fps:g}"
+        from .subtitles import detect_subtitles, roi_cache_key
+        key = roi_cache_key(settings)
         cache = wd / "ocr_subs.json"
         data = {}
         if cache.exists():
@@ -348,9 +417,8 @@ def render(video, settings: Settings, segments, cb: Callbacks = None, output=Non
                 data = {}
         if data.get("key") == key:
             samples = data["samples"]
-            cb.log("Dùng lại kết quả quét phụ đề OCR đã lưu")
+            cb.log("Dùng lại kết quả quét vùng phụ đề OCR đã lưu")
         else:
-            from .subtitles import detect_subtitles
             samples = detect_subtitles(video, info, settings, cb.log, p)
             cache.write_text(json.dumps({"key": key, "samples": samples}), encoding="utf-8")
         p(1.0)
@@ -365,27 +433,37 @@ def render(video, settings: Settings, segments, cb: Callbacks = None, output=Non
         encoding="utf-8-sig",
     )
 
-    # 5. Video Encode & Subtitle Burn
+    # 5. Video Encode & Subtitle Burn (supports dubbed audio, original BGM audio, or silent video!)
     p = cb.stage(STAGE_RENDER)
-    out = Path(output) if output else Path(video).with_name(f"{Path(video).stem}_{settings.target_lang}_dub.mp4")
+    suffix = "sub" if mode == "ocr_sub_only" else "dub"
+    out = Path(output) if output else Path(video).with_name(f"{Path(video).stem}_{settings.target_lang}_{suffix}.mp4")
     out = out.resolve()
     encoder = _pick_encoder(settings.use_gpu)
     cb.log(f"Mã hóa video đầu ra bằng {encoder}")
     vf = [f"subtitles={ass_name}"] if settings.burn_new_subs else []
-    common_out = (
-        ["-map", "0:v:0", "-map", "1:a:0"]
-        + _enc_args(encoder, settings.video_crf)
-        + ["-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-shortest", "-movflags", "+faststart", str(out)]
-    )
     use_blur = settings.blur_old_subs and any(s["blocks"] for s in samples)
     dur_sec = max(0.1, float(info["duration"]))
     log_f = open(wd / "ffmpeg_render.log", "wb")
     try:
         if not use_blur:
-            cmd = ["ffmpeg", "-y", "-progress", "pipe:1", "-nostats", "-i", video, "-i", str(audio_p)]
+            cmd = ["ffmpeg", "-y", "-progress", "pipe:1", "-nostats", "-i", video]
+            if audio_p is not None:
+                cmd += ["-i", str(audio_p)]
             if vf:
                 cmd += ["-vf", ",".join(vf)]
-            cmd += common_out
+            if audio_p is not None:
+                cmd += ["-map", "0:v:0", "-map", "1:a:0"] + _enc_args(encoder, settings.video_crf) + [
+                    "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-shortest", "-movflags", "+faststart", str(out)
+                ]
+            elif info["has_audio"]:
+                cmd += ["-map", "0:v:0", "-map", "0:a:0"] + _enc_args(encoder, settings.video_crf) + [
+                    "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(out)
+                ]
+            else:
+                cmd += ["-map", "0:v:0", "-an"] + _enc_args(encoder, settings.video_crf) + [
+                    "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(out)
+                ]
+
             proc = subprocess.Popen(
                 cmd, cwd=str(wd), stderr=log_f, stdout=subprocess.PIPE,
                 text=True, encoding="utf-8", errors="ignore", creationflags=CREATE_NO_WINDOW
@@ -410,11 +488,27 @@ def render(video, settings: Settings, segments, cb: Callbacks = None, output=Non
             fps_str = info["fps_str"] or f"{info['fps']}"
             cmd = [
                 "ffmpeg", "-y", "-f", "rawvideo", "-pix_fmt", "bgr24",
-                "-s", f"{W}x{H}", "-r", fps_str, "-i", "-", "-i", str(audio_p)
+                "-s", f"{W}x{H}", "-r", fps_str, "-i", "-"
             ]
+            if audio_p is not None:
+                cmd += ["-i", str(audio_p)]
+            elif info["has_audio"]:
+                cmd += ["-i", video]
             if vf:
                 cmd += ["-vf", ",".join(vf)]
-            cmd += common_out
+            if audio_p is not None:
+                cmd += ["-map", "0:v:0", "-map", "1:a:0"] + _enc_args(encoder, settings.video_crf) + [
+                    "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-shortest", "-movflags", "+faststart", str(out)
+                ]
+            elif info["has_audio"]:
+                cmd += ["-map", "0:v:0", "-map", "1:a:0"] + _enc_args(encoder, settings.video_crf) + [
+                    "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-shortest", "-movflags", "+faststart", str(out)
+                ]
+            else:
+                cmd += ["-map", "0:v:0", "-an"] + _enc_args(encoder, settings.video_crf) + [
+                    "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(out)
+                ]
+
             proc = subprocess.Popen(
                 cmd, cwd=str(wd), stdin=subprocess.PIPE, stderr=log_f,
                 stdout=subprocess.DEVNULL, creationflags=CREATE_NO_WINDOW

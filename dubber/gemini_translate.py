@@ -1,6 +1,7 @@
 """Context-aware Dubbing Script Translation via Google Gemini API with High-to-Low Model Cascade."""
 from __future__ import annotations
 
+import base64
 import json
 import re
 import time
@@ -266,25 +267,36 @@ def _call_gemini_generate(
     user_prompt: str,
     json_mode: bool = True,
     timeout: int = 75,
+    inline_images: Optional[List[Tuple[str, bytes]]] = None,
 ) -> Tuple[bool, str, str]:
-    """Call Gemini REST `generateContent`. Returns `(success, response_text, error_reason)`."""
+    """Call Gemini REST `generateContent` (Text or Multimodal Vision). Returns `(success, response_text, error_reason)`."""
     url = (
         f"https://generativelanguage.googleapis.com/v1beta/models/"
         f"{urllib.parse.quote(model_id)}:generateContent?key={urllib.parse.quote(api_key)}"
     )
     gen_cfg: dict = {
-        "temperature": 0.25,
+        "temperature": 0.2 if inline_images else 0.25,
         "maxOutputTokens": 8192,
     }
     if json_mode:
         gen_cfg["responseMimeType"] = "application/json"
+
+    user_parts: List[dict] = [{"text": user_prompt}]
+    if inline_images:
+        for mime_type, raw_bytes in inline_images:
+            user_parts.append({
+                "inlineData": {
+                    "mimeType": mime_type,
+                    "data": base64.b64encode(raw_bytes).decode("ascii"),
+                }
+            })
 
     body = {
         "systemInstruction": {
             "parts": [{"text": system_prompt}],
         },
         "contents": [
-            {"role": "user", "parts": [{"text": user_prompt}]},
+            {"role": "user", "parts": user_parts},
         ],
         "generationConfig": gen_cfg,
         "safetySettings": [
@@ -555,3 +567,169 @@ def translate_script_with_gemini(
             time.sleep(1.0)
 
     return final_translations
+
+
+# =============================================================================
+# 5. MULTIMODAL GEMINI VISION CONTACT-SHEET OCR (FOR BURNED-IN VIDEO SUBTITLES)
+# =============================================================================
+def _extract_ocr_json(raw_text: str) -> Tuple[str, Dict[int, str]]:
+    """Parse Gemini Vision OCR response JSON into `(detected_lang, {id: text})`."""
+    cleaned = raw_text.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+
+    parsed = None
+    try:
+        parsed = json.loads(cleaned)
+    except Exception:
+        m_obj = re.search(r"\{[\s\S]*\}", cleaned)
+        m_arr = re.search(r"\[[\s\S]*\]", cleaned)
+        for cand in (m_obj.group(0) if m_obj else None, m_arr.group(0) if m_arr else None):
+            if cand:
+                try:
+                    parsed = json.loads(cand)
+                    break
+                except Exception:
+                    continue
+
+    if parsed is None:
+        raise ValueError("Phản hồi OCR không đúng chuẩn JSON")
+
+    det_lang = ""
+    items_list = []
+    if isinstance(parsed, dict):
+        det_lang = str(parsed.get("detected_lang", "") or "").strip().lower()
+        items_list = parsed.get("items") or parsed.get("subtitles") or parsed.get("lines") or []
+    elif isinstance(parsed, list):
+        items_list = parsed
+
+    out_map: Dict[int, str] = {}
+    for it in items_list:
+        if isinstance(it, dict) and "id" in it:
+            try:
+                idx = int(it["id"])
+                val = str(it.get("text") if "text" in it else it.get("src", "")).strip()
+                out_map[idx] = val
+            except (ValueError, TypeError):
+                continue
+    return det_lang, out_map
+
+
+def ocr_contact_sheets_with_gemini(
+    sheets: List[Tuple[bytes, List[int]]],
+    raw_api_keys: str,
+    src_lang_hint: str = "auto",
+    log=print,
+    progress=None,
+    cancelled=None,
+) -> Tuple[Dict[int, str], str]:
+    """Read burned-in subtitle crops stitched into numbered contact-sheet JPEGs using Gemini Vision cascade.
+
+    Args:
+        sheets: list of `(jpeg_bytes, list_of_row_ids)`
+    Returns:
+        `(id_to_text_map, detected_iso_lang)`
+    """
+    keys = parse_api_keys(raw_api_keys)
+    if not keys or not sheets:
+        return {}, ""
+
+    key_models: List[List[Tuple[str, str]]] = [resolve_ordered_models(k) for k in keys]
+    candidates: List[Tuple[int, str, str, str]] = []
+    max_tiers = max(len(m) for m in key_models)
+    for t_idx in range(max_tiers):
+        for k_idx, k_str in enumerate(keys):
+            if t_idx < len(key_models[k_idx]):
+                mid, mlbl = key_models[k_idx][t_idx]
+                candidates.append((k_idx, k_str, mid, mlbl))
+
+    hint_line = (
+        f"Ngôn ngữ phụ đề dự kiến: {src_lang_hint}."
+        if src_lang_hint and src_lang_hint != "auto"
+        else "Tự động nhận diện chính xác ngôn ngữ hiển thị (Trung, Nhật, Hàn, Anh, Việt, Thái, v.v.)."
+    )
+    sys_prompt = (
+        "Bạn là hệ thống OCR đọc phụ đề video chính xác tuyệt đối.\n"
+        "Ảnh đính kèm là bảng ghép nhiều hàng ảnh cắt phụ đề từ video. "
+        "Bên trái mỗi hàng có nhãn số màu vàng dạng `#0`, `#1`, `#2`...\n"
+        f"{hint_line}\n"
+        "NHIỆM VỤ:\n"
+        "- Đọc NGUYÊN VĂN 100% nội dung chữ phụ đề xuất hiện trên từng hàng (KHÔNG dịch, KHÔNG bịa thêm chữ).\n"
+        "- Bỏ qua logo/watermark nhỏ không phải câu phụ đề; nếu hàng nào chỉ là hình ảnh nhiễu không có chữ rõ ràng thì trả text là chuỗi rỗng \"\".\n"
+        "- Nếu 1 hàng có 2 dòng chữ phụ đề, nối gọn bằng 1 khoảng trắng (hoặc giữ liền mạch với tiếng Trung/Nhật).\n"
+        "- Trả về DUY NHẤT 1 JSON hợp lệ:\n"
+        '{\n'
+        '  "detected_lang": "mã ISO-639-1 như zh, ja, ko, en, vi, th, fr, ru...",\n'
+        '  "items": [{"id": 0, "text": "nguyên văn dòng #0"}, ...]\n'
+        '}'
+    )
+
+    depleted: set[Tuple[int, str]] = set()
+    all_texts: Dict[int, str] = {}
+    detected_langs: List[str] = []
+    total_sheets = len(sheets)
+
+    for s_idx, (jpeg_bytes, row_ids) in enumerate(sheets):
+        if cancelled and cancelled():
+            raise InterruptedError("Đã hủy")
+
+        usr_prompt = (
+            f"Hãy đọc nguyên văn phụ đề của {len(row_ids)} hàng ảnh có mã số id = {row_ids} trong ảnh đính kèm "
+            f"và trả về đúng JSON."
+        )
+        sheet_ok = False
+        last_err = ""
+
+        for k_idx, k_str, mid, mlbl in candidates:
+            if cancelled and cancelled():
+                raise InterruptedError("Đã hủy")
+            if (k_idx, mid) in depleted:
+                continue
+
+            key_tag = f" (Key #{k_idx + 1})" if len(keys) > 1 else ""
+            ok, raw_out, err = _call_gemini_generate(
+                k_str,
+                mid,
+                sys_prompt,
+                usr_prompt,
+                json_mode=True,
+                timeout=85,
+                inline_images=[("image/jpeg", jpeg_bytes)],
+            )
+            if not ok:
+                last_err = f"{mlbl}: {err}"
+                if any(code in err for code in ("429", "RESOURCE_EXHAUSTED", "404", "NOT_FOUND", "403", "400")):
+                    depleted.add((k_idx, mid))
+                log(f"  ⚠ OCR Vision ({mlbl}{key_tag}) lỗi/hết lượt ({err[:75]}) ➜ Chuyển model kế tiếp...")
+                continue
+
+            try:
+                d_lang, out_map = _extract_ocr_json(raw_out)
+                if len(out_map) < max(1, int(len(row_ids) * 0.5)):
+                    raise ValueError(f"Thiếu hàng OCR ({len(out_map)}/{len(row_ids)})")
+                all_texts.update(out_map)
+                if d_lang:
+                    detected_langs.append(d_lang)
+                log(f"  ✔ Đọc chữ phụ đề Vision AI nhóm {s_idx + 1}/{total_sheets} ({len(row_ids)} câu) bằng {mlbl}{key_tag}")
+                sheet_ok = True
+                break
+            except Exception as parse_e:
+                last_err = f"{mlbl}: {parse_e}"
+                log(f"  ⚠ OCR Vision ({mlbl}{key_tag}) lỗi định dạng ({parse_e}) ➜ Đổi model...")
+                continue
+
+        if not sheet_ok:
+            log(f"  ⚠ Không thể đọc nhóm ảnh {s_idx + 1}/{total_sheets} bằng Gemini Vision ({last_err}) — dùng kết quả RapidOCR dự phòng.")
+
+        if progress:
+            progress(min(1.0, (s_idx + 1) / total_sheets))
+
+        if s_idx + 1 < total_sheets:
+            time.sleep(0.8)
+
+    best_lang = ""
+    if detected_langs:
+        # Most frequent detected language across sheets
+        best_lang = max(set(detected_langs), key=detected_langs.count)
+    return all_texts, best_lang

@@ -207,6 +207,7 @@ NLLB_MODELS = {
 
 @dataclass
 class Settings:
+    process_mode: str = "dub_audio"      # "dub_audio" | "ocr_sub_only" | "ocr_sub_dub"
     source_lang: str = "auto"            # "auto" or key of LANGUAGES
     target_lang: str = "vi"
     whisper_model: str = "medium"
@@ -230,8 +231,10 @@ class Settings:
     # subtitles
     blur_old_subs: bool = True
     burn_new_subs: bool = True
-    sub_region_top: float = 0.72         # search region for old subs (fraction of height: bottom 28%)
-    sub_region_bottom: float = 0.98
+    sub_region_left: float = 0.02        # horizontal left edge of movable ROI (0..1)
+    sub_region_right: float = 0.98       # horizontal right edge of movable ROI (0..1)
+    sub_region_top: float = 0.72         # vertical top edge of movable ROI (0..1)
+    sub_region_bottom: float = 0.98      # vertical bottom edge of movable ROI (0..1)
     ocr_fps: float = 5.0                 # frames per second sampled for OCR
     blur_style: str = "inpaint_blur"     # inpaint_blur | box | blur | pixelate
     sub_font_size: int = 0               # 0 = auto consistent size

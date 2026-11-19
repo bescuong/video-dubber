@@ -30,7 +30,7 @@ if sys.stdout is None:
 if sys.stderr is None:
     sys.stderr = _SafeStream()
 
-EMBEDDED_APP_VERSION = "2.2.0"
+EMBEDDED_APP_VERSION = "2.3.0"
 
 
 def _boot_hotpatch_if_newer():
@@ -92,8 +92,8 @@ from dubber.login_dialog import LoginDialog
 
 import cv2
 import numpy as np
-from PySide6.QtCore import Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QColor, QDragEnterEvent, QDropEvent, QFont, QIcon, QImage, QPixmap
+from PySide6.QtCore import QRect, Qt, QThread, QTimer, Signal
+from PySide6.QtGui import QColor, QDragEnterEvent, QDropEvent, QFont, QIcon, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -126,7 +126,7 @@ from PySide6.QtWidgets import (
 )
 
 VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".flv", ".m4v", ".ts"}
-APP_VERSION = "2.2.0"
+APP_VERSION = "2.3.0"
 
 
 def _app_icon() -> QIcon:
@@ -406,7 +406,7 @@ class BatchWorker(QThread):
     log_sig = Signal(str)
 
     # Stage weights for accurate per-video 0..100% calculation in batch mode
-    _WEIGHTS = {
+    _WEIGHTS_AUDIO = {
         pipeline.STAGE_SEPARATE: (0.00, 0.18),
         pipeline.STAGE_ASR: (0.18, 0.18),
         pipeline.STAGE_DIARIZE: (0.36, 0.04),
@@ -415,6 +415,18 @@ class BatchWorker(QThread):
         pipeline.STAGE_MIX: (0.68, 0.02),
         pipeline.STAGE_OCR: (0.70, 0.12),
         pipeline.STAGE_RENDER: (0.82, 0.18),
+    }
+    _WEIGHTS_OCR_ONLY = {
+        pipeline.STAGE_OCR: (0.00, 0.42),
+        pipeline.STAGE_TRANSLATE: (0.42, 0.18),
+        pipeline.STAGE_RENDER: (0.60, 0.40),
+    }
+    _WEIGHTS_OCR_DUB = {
+        pipeline.STAGE_OCR: (0.00, 0.30),
+        pipeline.STAGE_TRANSLATE: (0.30, 0.14),
+        pipeline.STAGE_TTS: (0.44, 0.24),
+        pipeline.STAGE_MIX: (0.68, 0.03),
+        pipeline.STAGE_RENDER: (0.71, 0.29),
     }
 
     def __init__(self, items: list[dict], settings: Settings, out_dir: str = ""):
@@ -428,7 +440,12 @@ class BatchWorker(QThread):
         self._cancel = True
 
     def _map_frac(self, stage: str, frac: float) -> float:
-        base, span = self._WEIGHTS.get(stage, (0.0, 1.0))
+        pmode = getattr(self.settings, "process_mode", "dub_audio")
+        wmap = (
+            self._WEIGHTS_OCR_ONLY if pmode == "ocr_sub_only"
+            else (self._WEIGHTS_OCR_DUB if pmode == "ocr_sub_dub" else self._WEIGHTS_AUDIO)
+        )
+        base, span = wmap.get(stage, (0.0, 1.0))
         return min(0.99, base + span * float(np.clip(frac, 0.0, 1.0)))
 
     def run(self):
@@ -453,12 +470,13 @@ class BatchWorker(QThread):
             self.item_started.emit(idx, fname)
             self.log_sig.emit(f"\n[{idx + 1}/{total}] Đang xử lý: {fname}")
 
+            suffix = "sub" if getattr(self.settings, "process_mode", "dub_audio") == "ocr_sub_only" else "dub"
             if self.out_dir and os.path.isdir(self.out_dir):
                 stem = Path(video_path).stem
-                out_path = str(Path(self.out_dir) / f"{stem}_{self.settings.target_lang}_dub.mp4")
+                out_path = str(Path(self.out_dir) / f"{stem}_{self.settings.target_lang}_{suffix}.mp4")
             else:
                 vp = Path(video_path)
-                out_path = str(vp.with_name(f"{vp.stem}_{self.settings.target_lang}_dub.mp4"))
+                out_path = str(vp.with_name(f"{vp.stem}_{self.settings.target_lang}_{suffix}.mp4"))
 
             cb = pipeline.Callbacks(
                 log=lambda msg: self.log_sig.emit(f"  {msg}"),
@@ -499,11 +517,19 @@ class PipelineProgressCard(QFrame):
             (pipeline.STAGE_DIARIZE, "3. Phân vai", 0.08),
             (pipeline.STAGE_TRANSLATE, "4. Dịch kịch bản", 0.24),
         ],
+        "analyze_ocr": [
+            (pipeline.STAGE_OCR, "1. Quét chữ phụ đề (OCR)", 0.65),
+            (pipeline.STAGE_TRANSLATE, "2. Dịch phụ đề AI", 0.35),
+        ],
         "render": [
             (pipeline.STAGE_TTS, "1. Lồng tiếng", 0.32),
             (pipeline.STAGE_MIX, "2. Trộn nhạc", 0.04),
             (pipeline.STAGE_OCR, "3. Quét phụ đề", 0.26),
             (pipeline.STAGE_RENDER, "4. Xuất Video", 0.38),
+        ],
+        "render_ocr": [
+            (pipeline.STAGE_OCR, "1. Vùng phụ đề cũ", 0.25),
+            (pipeline.STAGE_RENDER, "2. Xóa sub cũ & Ghép sub mới", 0.75),
         ],
         "both": [
             (pipeline.STAGE_SEPARATE, "1. Tách nhạc", 0.18),
@@ -513,6 +539,17 @@ class PipelineProgressCard(QFrame):
             (pipeline.STAGE_TTS, "5. Lồng tiếng", 0.16),
             (pipeline.STAGE_OCR, "6. Phụ đề OCR", 0.12),
             (pipeline.STAGE_RENDER, "7. Xuất Video", 0.20),
+        ],
+        "both_ocr": [
+            (pipeline.STAGE_OCR, "1. Quét chữ sub (OCR)", 0.42),
+            (pipeline.STAGE_TRANSLATE, "2. Dịch phụ đề", 0.20),
+            (pipeline.STAGE_RENDER, "3. Xóa sub cũ & Ghép sub mới", 0.38),
+        ],
+        "both_ocr_dub": [
+            (pipeline.STAGE_OCR, "1. Quét chữ sub (OCR)", 0.30),
+            (pipeline.STAGE_TRANSLATE, "2. Dịch phụ đề", 0.14),
+            (pipeline.STAGE_TTS, "3. Lồng tiếng AI", 0.26),
+            (pipeline.STAGE_RENDER, "4. Xóa sub cũ & Xuất Video", 0.30),
         ],
     }
 
@@ -707,18 +744,31 @@ class PipelineProgressCard(QFrame):
 # PREVIEW & BATCH TABLE WIDGETS
 # =============================================================================
 class PreviewLabel(QLabel):
+    """Interactive video frame preview with a draggable & 8-handle resizable Subtitle Detection ROI box."""
     file_dropped = Signal(str)
+    roi_changed = Signal(float, float, float, float)  # (left, top, right, bottom) in [0..1]
+
+    _MIN_W = 0.08
+    _MIN_H = 0.04
+    _HANDLE_HIT = 11
 
     def __init__(self):
         super().__init__("🎬 Kéo thả video vào đây\nhoặc bấm '📂 Chọn Video' ở trên")
         self.setAlignment(Qt.AlignCenter)
         self.setMinimumSize(440, 250)
         self.setAcceptDrops(True)
+        self.setMouseTracking(True)
         self.setStyleSheet(
             "QLabel { background-color: #111827; color: #9ca3af; font-size: 13px; "
             "border: 1px solid #374151; border-radius: 8px; }"
         )
-        self._pixmap = None
+        self._pixmap: QPixmap | None = None
+        self._scaled_pixmap: QPixmap | None = None
+        self._roi: list[float] = [0.02, 0.72, 0.98, 0.98]  # [left, top, right, bottom]
+        self._show_roi: bool = True
+        self._drag_mode: str | None = None  # None | 'move' | 'draw' | 'tl'|'tr'|'bl'|'br'|'t'|'b'|'l'|'r'
+        self._drag_start_norm: tuple[float, float] = (0.0, 0.0)
+        self._drag_orig_roi: list[float] = list(self._roi)
 
     def set_frame(self, bgr: np.ndarray):
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
@@ -726,15 +776,253 @@ class PreviewLabel(QLabel):
         qimg = QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888).copy()
         self._pixmap = QPixmap.fromImage(qimg)
         self._rescale()
+        self.update()
+
+    def set_roi(self, left: float, top: float, right: float, bottom: float, emit: bool = False):
+        l = float(np.clip(left, 0.0, 1.0 - self._MIN_W))
+        r = float(np.clip(right, l + self._MIN_W, 1.0))
+        t = float(np.clip(top, 0.0, 1.0 - self._MIN_H))
+        b = float(np.clip(bottom, t + self._MIN_H, 1.0))
+        self._roi = [l, t, r, b]
+        self.update()
+        if emit:
+            self.roi_changed.emit(l, t, r, b)
+
+    def get_roi(self) -> tuple[float, float, float, float]:
+        return tuple(self._roi)  # type: ignore[return-value]
+
+    def set_show_roi(self, visible: bool):
+        self._show_roi = bool(visible)
+        self.update()
 
     def _rescale(self):
         if self._pixmap is not None:
-            scaled = self._pixmap.scaled(self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            super().setPixmap(scaled)
+            self._scaled_pixmap = self._pixmap.scaled(self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        else:
+            self._scaled_pixmap = None
+
+    def _image_rect(self) -> QRect:
+        if self._scaled_pixmap is None:
+            return QRect()
+        pw = self._scaled_pixmap.width()
+        ph = self._scaled_pixmap.height()
+        ox = (self.width() - pw) // 2
+        oy = (self.height() - ph) // 2
+        return QRect(ox, oy, pw, ph)
+
+    def _roi_widget_rect(self) -> QRect:
+        ir = self._image_rect()
+        if ir.isNull() or ir.width() < 2 or ir.height() < 2:
+            return QRect()
+        l, t, r, b = self._roi
+        x1 = int(round(ir.left() + l * ir.width()))
+        y1 = int(round(ir.top() + t * ir.height()))
+        x2 = int(round(ir.left() + r * ir.width()))
+        y2 = int(round(ir.top() + b * ir.height()))
+        return QRect(x1, y1, max(4, x2 - x1), max(4, y2 - y1))
+
+    def _pos_to_norm(self, px: float, py: float) -> tuple[float, float]:
+        ir = self._image_rect()
+        if ir.isNull() or ir.width() <= 0 or ir.height() <= 0:
+            return 0.0, 0.0
+        nx = float(np.clip((px - ir.left()) / ir.width(), 0.0, 1.0))
+        ny = float(np.clip((py - ir.top()) / ir.height(), 0.0, 1.0))
+        return nx, ny
+
+    def _hit_test(self, px: float, py: float) -> str | None:
+        if self._scaled_pixmap is None or not self._show_roi:
+            return None
+        ir = self._image_rect()
+        if not ir.adjusted(-12, -12, 12, 12).contains(int(px), int(py)):
+            return None
+        rr = self._roi_widget_rect()
+        if rr.isNull():
+            return None
+
+        ht = self._HANDLE_HIT
+        cx = rr.center().x()
+        cy = rr.center().y()
+        handles = [
+            ("tl", rr.left(), rr.top()),
+            ("tr", rr.right(), rr.top()),
+            ("bl", rr.left(), rr.bottom()),
+            ("br", rr.right(), rr.bottom()),
+            ("t", cx, rr.top()),
+            ("b", cx, rr.bottom()),
+            ("l", rr.left(), cy),
+            ("r", rr.right(), cy),
+        ]
+        for name, hx, hy in handles:
+            if abs(px - hx) <= ht and abs(py - hy) <= ht:
+                return name
+        # Also allow grabbing anywhere along the 4 edges cleanly
+        if rr.left() <= px <= rr.right():
+            if abs(py - rr.top()) <= 7:
+                return "t"
+            if abs(py - rr.bottom()) <= 7:
+                return "b"
+        if rr.top() <= py <= rr.bottom():
+            if abs(px - rr.left()) <= 7:
+                return "l"
+            if abs(px - rr.right()) <= 7:
+                return "r"
+        if rr.contains(int(px), int(py)):
+            return "move"
+        return "draw"
+
+    def _cursor_for_hit(self, hit: str | None):
+        if hit in ("tl", "br"):
+            return Qt.SizeFDiagCursor
+        if hit in ("tr", "bl"):
+            return Qt.SizeBDiagCursor
+        if hit in ("t", "b"):
+            return Qt.SizeVerCursor
+        if hit in ("l", "r"):
+            return Qt.SizeHorCursor
+        if hit == "move":
+            return Qt.OpenHandCursor
+        if hit == "draw":
+            return Qt.CrossCursor
+        return Qt.ArrowCursor
+
+    def paintEvent(self, ev):
+        if self._scaled_pixmap is None:
+            super().paintEvent(ev)
+            return
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.fillRect(self.rect(), QColor("#111827"))
+
+        ir = self._image_rect()
+        painter.drawPixmap(ir.topLeft(), self._scaled_pixmap)
+
+        if self._show_roi and not ir.isNull():
+            rr = self._roi_widget_rect()
+            # Translucent green highlight inside movable subtitle ROI
+            painter.fillRect(rr, QColor(34, 197, 94, 34))
+
+            # Crisp bright green border
+            pen = QPen(QColor("#22c55e"), 2)
+            painter.setPen(pen)
+            painter.drawRect(rr)
+
+            # 8 interactive white-filled resize handles (corners + edge midpoints)
+            hs = 4
+            cx = rr.center().x()
+            cy = rr.center().y()
+            pts = [
+                (rr.left(), rr.top()), (rr.right(), rr.top()),
+                (rr.left(), rr.bottom()), (rr.right(), rr.bottom()),
+                (cx, rr.top()), (cx, rr.bottom()),
+                (rr.left(), cy), (rr.right(), cy),
+            ]
+            painter.setBrush(QColor("#ffffff"))
+            painter.setPen(QPen(QColor("#15803d"), 1.5))
+            for hx, hy in pts:
+                painter.drawRect(int(hx - hs), int(hy - hs), hs * 2, hs * 2)
+
+            # Floating hint badge above (or inside top of) the ROI box
+            badge_txt = "🎯 Khung quét phụ đề (Kéo di chuyển · Kéo góc co giãn)"
+            painter.setFont(QFont("Segoe UI", 8, QFont.Bold))
+            fm = painter.fontMetrics()
+            tw = fm.horizontalAdvance(badge_txt) + 12
+            th = fm.height() + 4
+            bx = max(ir.left() + 4, min(rr.left(), ir.right() - tw - 4))
+            by = rr.top() - th - 3 if (rr.top() - th - 3 >= ir.top() + 2) else (rr.top() + 4)
+            badge_rect = QRect(bx, by, tw, th)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(17, 24, 39, 200))
+            painter.drawRoundedRect(badge_rect, 4, 4)
+            painter.setPen(QColor("#86efac"))
+            painter.drawText(badge_rect, Qt.AlignCenter, badge_txt)
+
+        painter.end()
+
+    def mousePressEvent(self, ev):
+        if ev.button() == Qt.LeftButton and self._scaled_pixmap is not None and self._show_roi:
+            pos = ev.position()
+            hit = self._hit_test(pos.x(), pos.y())
+            if hit is not None:
+                self._drag_mode = hit
+                self._drag_start_norm = self._pos_to_norm(pos.x(), pos.y())
+                self._drag_orig_roi = list(self._roi)
+                if hit == "move":
+                    self.setCursor(Qt.ClosedHandCursor)
+                ev.accept()
+                return
+        super().mousePressEvent(ev)
+
+    def mouseMoveEvent(self, ev):
+        pos = ev.position()
+        if self._drag_mode is None:
+            hit = self._hit_test(pos.x(), pos.y())
+            self.setCursor(self._cursor_for_hit(hit))
+            super().mouseMoveEvent(ev)
+            return
+
+        nx, ny = self._pos_to_norm(pos.x(), pos.y())
+        sx, sy = self._drag_start_norm
+        ol, ot, or_, ob = self._drag_orig_roi
+        l, t, r, b = ol, ot, or_, ob
+        mode = self._drag_mode
+
+        if mode == "move":
+            dx = nx - sx
+            dy = ny - sy
+            bw = or_ - ol
+            bh = ob - ot
+            l = float(np.clip(ol + dx, 0.0, 1.0 - bw))
+            t = float(np.clip(ot + dy, 0.0, 1.0 - bh))
+            r = l + bw
+            b = t + bh
+        elif mode == "draw":
+            l = min(sx, nx)
+            r = max(sx, nx)
+            t = min(sy, ny)
+            b = max(sy, ny)
+            if r - l < self._MIN_W:
+                r = min(1.0, l + self._MIN_W)
+                l = max(0.0, r - self._MIN_W)
+            if b - t < self._MIN_H:
+                b = min(1.0, t + self._MIN_H)
+                t = max(0.0, b - self._MIN_H)
+        else:
+            if "l" in mode:
+                l = float(np.clip(nx, 0.0, r - self._MIN_W))
+            if "r" in mode:
+                r = float(np.clip(nx, l + self._MIN_W, 1.0))
+            if "t" in mode:
+                t = float(np.clip(ny, 0.0, b - self._MIN_H))
+            if "b" in mode:
+                b = float(np.clip(ny, t + self._MIN_H, 1.0))
+
+        self._roi = [l, t, r, b]
+        self.update()
+        self.roi_changed.emit(l, t, r, b)
+        ev.accept()
+
+    def mouseReleaseEvent(self, ev):
+        if self._drag_mode is not None:
+            self._drag_mode = None
+            pos = ev.position()
+            self.setCursor(self._cursor_for_hit(self._hit_test(pos.x(), pos.y())))
+            ev.accept()
+            return
+        super().mouseReleaseEvent(ev)
+
+    def mouseDoubleClickEvent(self, ev):
+        if self._scaled_pixmap is not None and self._show_roi:
+            # Double-click resets ROI box smoothly to standard bottom subtitle zone
+            self.set_roi(0.02, 0.72, 0.98, 0.98, emit=True)
+            ev.accept()
+            return
+        super().mouseDoubleClickEvent(ev)
 
     def resizeEvent(self, ev):
         super().resizeEvent(ev)
         self._rescale()
+        self.update()
 
     def dragEnterEvent(self, ev: QDragEnterEvent):
         if ev.mimeData().hasUrls():
@@ -813,6 +1101,7 @@ class MainWindow(QMainWindow):
         self._setup_tray()
         self._refresh_voice_combo()
         self._sync_tts_engine_ui()
+        self._sync_process_mode_ui()
         self._refresh_gemini_badge()
 
         # Live Firebase account heartbeat (every 2.5 minutes) — kicks immediately if disabled on Firebase
@@ -986,11 +1275,12 @@ class MainWindow(QMainWindow):
         left_layout.setSpacing(8)
 
         # Video Preview Card
-        prev_box = QGroupBox("Xem trước khung hình & Vùng phụ đề")
+        prev_box = QGroupBox("Xem trước khung hình & Khung quét phụ đề (Kéo thả trực tiếp trên video)")
         prev_v = QVBoxLayout(prev_box)
         prev_v.setSpacing(6)
         self.preview = PreviewLabel()
         self.preview.file_dropped.connect(self._load_video)
+        self.preview.roi_changed.connect(self._on_preview_roi_changed)
         prev_v.addWidget(self.preview, 1)
 
         scrub_row = QHBoxLayout()
@@ -1001,18 +1291,28 @@ class MainWindow(QMainWindow):
         self.slider_time.setEnabled(False)
         self.slider_time.valueChanged.connect(self._on_scrub)
 
-        self.btn_test_blur = QPushButton("🔍 Xem thử xóa phụ đề khung này")
+        self.btn_reset_roi = QPushButton("↺ Đặt lại khung")
+        self.btn_reset_roi.setToolTip("Đặt lại khung quét phụ đề về vị trí mặc định phía dưới (hoặc nhấp đúp trên video)")
+        self.btn_reset_roi.clicked.connect(self._reset_roi_box)
+
+        self.btn_test_blur = QPushButton("🔍 Xem thử xóa phụ đề")
         self.btn_test_blur.setEnabled(False)
         self.btn_test_blur.clicked.connect(self._preview_blur_frame)
 
         scrub_row.addWidget(self.lbl_time)
         scrub_row.addWidget(self.slider_time, 1)
+        scrub_row.addWidget(self.btn_reset_roi)
         scrub_row.addWidget(self.btn_test_blur)
         prev_v.addLayout(scrub_row)
 
+        meta_row = QHBoxLayout()
         self.lbl_meta = QLabel("Chưa tải video")
         self.lbl_meta.setStyleSheet("color: #6b7280; font-size: 12px;")
-        prev_v.addWidget(self.lbl_meta)
+        self.lbl_roi_info = QLabel("🎯 Khung quét: X 2%→98% · Y 72%→98%")
+        self.lbl_roi_info.setStyleSheet("color: #15803d; font-size: 11px; font-weight: 600;")
+        meta_row.addWidget(self.lbl_meta, 1)
+        meta_row.addWidget(self.lbl_roi_info)
+        prev_v.addLayout(meta_row)
         left_layout.addWidget(prev_box, 3)
 
         # Clean 2-Tab Settings Panel (keeps UI super simple while retaining full power!)
@@ -1126,8 +1426,31 @@ class MainWindow(QMainWindow):
 
     def _build_quick_settings(self, parent: QWidget):
         lay = QVBoxLayout(parent)
-        lay.setContentsMargins(10, 10, 10, 10)
-        lay.setSpacing(10)
+        lay.setContentsMargins(10, 8, 10, 8)
+        lay.setSpacing(8)
+
+        # Row 0: Processing Mode (Audio Dubbing vs Text-Only Silent Subtitle OCR vs OCR + Dubbing)
+        pmode_row = QHBoxLayout()
+        self.cb_process_mode = QComboBox()
+        self.cb_process_mode.addItem("🎬 Lồng tiếng + Phụ đề (Từ giọng nói gốc)", "dub_audio")
+        self.cb_process_mode.addItem("📝 Chỉ dịch phụ đề chữ trên video (Video không tiếng / Chỉ có sub)", "ocr_sub_only")
+        self.cb_process_mode.addItem("🎙 Quét chữ sub trên video ➜ Dịch + Lồng tiếng AI + Thay phụ đề", "ocr_sub_dub")
+        self.cb_process_mode.currentIndexChanged.connect(self._sync_process_mode_ui)
+        pmode_row.addWidget(QLabel("Chế độ xử lý:"))
+        pmode_row.addWidget(self.cb_process_mode, 1)
+        lay.addLayout(pmode_row)
+
+        self.lbl_ocr_mode_tip = QLabel(
+            "💡 Chế độ quét chữ trên video (OCR): Hãy dùng chuột kéo khung màu xanh ở màn hình xem trước "
+            "đặt đúng vào vùng chữ phụ đề gốc. Hệ thống sẽ quét chữ ➜ Dịch ➜ Xóa sub cũ ➜ Hiển thị sub mới!"
+        )
+        self.lbl_ocr_mode_tip.setWordWrap(True)
+        self.lbl_ocr_mode_tip.setStyleSheet(
+            "background: #eff6ff; color: #1e40af; border: 1px solid #bfdbfe; "
+            "border-radius: 6px; padding: 6px 8px; font-size: 11px;"
+        )
+        self.lbl_ocr_mode_tip.setVisible(False)
+        lay.addWidget(self.lbl_ocr_mode_tip)
 
         # Row 1: Source -> Target Language
         lang_row = QHBoxLayout()
@@ -1144,7 +1467,7 @@ class MainWindow(QMainWindow):
 
         lang_row.addWidget(QLabel("Ngôn ngữ gốc:"))
         lang_row.addWidget(self.cb_src, 1)
-        lang_row.addWidget(QLabel("➔  Dịch & Lồng sang:"))
+        lang_row.addWidget(QLabel("➔  Dịch sang:"))
         lang_row.addWidget(self.cb_tgt, 1)
         lay.addLayout(lang_row)
 
@@ -1162,6 +1485,12 @@ class MainWindow(QMainWindow):
         style_row.addWidget(self.ed_trans_notes, 2)
         lay.addLayout(style_row)
 
+        # TTS Voice Controls Container (hidden cleanly when in pure Subtitle-Only OCR mode)
+        self.w_tts_section = QWidget()
+        tts_sec_v = QVBoxLayout(self.w_tts_section)
+        tts_sec_v.setContentsMargins(0, 0, 0, 0)
+        tts_sec_v.setSpacing(6)
+
         # Row 2: TTS Engine Selector (OmniVoice AI vs Edge Neural TTS)
         tts_eng_row = QHBoxLayout()
         self.cb_tts_engine = QComboBox()
@@ -1172,7 +1501,7 @@ class MainWindow(QMainWindow):
         self.cb_tts_engine.currentIndexChanged.connect(self._sync_tts_engine_ui)
         tts_eng_row.addWidget(QLabel("Thư viện giọng:"))
         tts_eng_row.addWidget(self.cb_tts_engine, 1)
-        lay.addLayout(tts_eng_row)
+        tts_sec_v.addLayout(tts_eng_row)
 
         # Row 3A: OmniVoice Controls (Visible when OmniVoice AI is active)
         self.w_omni_box = QWidget()
@@ -1211,7 +1540,7 @@ class MainWindow(QMainWindow):
         ref_h.addWidget(self.ed_omni_ref, 1)
         ref_h.addWidget(btn_pick_ref)
         omni_v.addWidget(self.w_omni_ref_row)
-        lay.addWidget(self.w_omni_box)
+        tts_sec_v.addWidget(self.w_omni_box)
 
         # Row 3B: Edge Neural TTS Controls (Visible when Edge TTS is active)
         self.w_edge_box = QWidget()
@@ -1244,17 +1573,19 @@ class MainWindow(QMainWindow):
         voice_row.addWidget(self.cb_voice_pick, 1)
         voice_row.addWidget(self.btn_preview_voice)
         edge_v.addLayout(voice_row)
-        lay.addWidget(self.w_edge_box)
+        tts_sec_v.addWidget(self.w_edge_box)
 
-        # Row 4: Clean Toggle Checkboxes
+        # Row 4: Demucs vocal separator (only applies in audio dubbing mode)
         self.chk_demucs = QCheckBox("🎵 Giữ nguyên nhạc nền & tiếng động gốc (Tách giọng AI Demucs)")
         self.chk_demucs.setChecked(True)
-        lay.addWidget(self.chk_demucs)
+        tts_sec_v.addWidget(self.chk_demucs)
+
+        lay.addWidget(self.w_tts_section)
 
         sub_quick = QHBoxLayout()
         self.chk_blur = QCheckBox("🧹 Tự động xóa sạch phụ đề gốc")
         self.chk_blur.setChecked(True)
-        self.chk_burn = QCheckBox("📝 Chèn phụ đề mới đồng bộ lời nói")
+        self.chk_burn = QCheckBox("📝 Chèn phụ đề mới đã dịch")
         self.chk_burn.setChecked(True)
         sub_quick.addWidget(self.chk_blur)
         sub_quick.addWidget(self.chk_burn)
@@ -1286,8 +1617,20 @@ class MainWindow(QMainWindow):
         cover_row.addWidget(self.chk_sub_bg)
         form.addRow("Kiểu che sub cũ:", cover_row)
 
-        # Scan Region & Font Size
+        # Scan Region (4-sided synced with draggable ROI box) & Font Size
         reg_row = QHBoxLayout()
+        self.sp_reg_left = QSpinBox()
+        self.sp_reg_left.setRange(0, 90)
+        self.sp_reg_left.setSuffix("%")
+        self.sp_reg_left.setValue(2)
+        self.sp_reg_left.valueChanged.connect(self._refresh_preview_overlay)
+
+        self.sp_reg_right = QSpinBox()
+        self.sp_reg_right.setRange(10, 100)
+        self.sp_reg_right.setSuffix("%")
+        self.sp_reg_right.setValue(98)
+        self.sp_reg_right.valueChanged.connect(self._refresh_preview_overlay)
+
         self.sp_reg_top = QSpinBox()
         self.sp_reg_top.setRange(0, 95)
         self.sp_reg_top.setSuffix("%")
@@ -1295,7 +1638,7 @@ class MainWindow(QMainWindow):
         self.sp_reg_top.valueChanged.connect(self._refresh_preview_overlay)
 
         self.sp_reg_bot = QSpinBox()
-        self.sp_reg_bot.setRange(10, 100)
+        self.sp_reg_bot.setRange(5, 100)
         self.sp_reg_bot.setSuffix("%")
         self.sp_reg_bot.setValue(98)
         self.sp_reg_bot.valueChanged.connect(self._refresh_preview_overlay)
@@ -1303,21 +1646,26 @@ class MainWindow(QMainWindow):
         self.sp_fontsize = QSpinBox()
         self.sp_fontsize.setRange(0, 140)
         self.sp_fontsize.setValue(0)
-        self.sp_fontsize.setSpecialValueText("Tự động chuẩn")
+        self.sp_fontsize.setSpecialValueText("Tự động")
 
         self.sp_ocr_fps = QDoubleSpinBox()
         self.sp_ocr_fps.setRange(2.0, 10.0)
         self.sp_ocr_fps.setSingleStep(1.0)
         self.sp_ocr_fps.setValue(5.0)
 
-        reg_row.addWidget(QLabel("Từ:"))
+        reg_row.addWidget(QLabel("X:"))
+        reg_row.addWidget(self.sp_reg_left)
+        reg_row.addWidget(QLabel("→"))
+        reg_row.addWidget(self.sp_reg_right)
+        reg_row.addSpacing(4)
+        reg_row.addWidget(QLabel("Y:"))
         reg_row.addWidget(self.sp_reg_top)
-        reg_row.addWidget(QLabel("đến:"))
+        reg_row.addWidget(QLabel("→"))
         reg_row.addWidget(self.sp_reg_bot)
-        reg_row.addSpacing(8)
+        reg_row.addSpacing(6)
         reg_row.addWidget(QLabel("Cỡ chữ:"))
         reg_row.addWidget(self.sp_fontsize)
-        reg_row.addSpacing(8)
+        reg_row.addSpacing(6)
         reg_row.addWidget(QLabel("OCR fps:"))
         reg_row.addWidget(self.sp_ocr_fps)
         form.addRow("Vùng quét sub:", reg_row)
@@ -1574,6 +1922,31 @@ class MainWindow(QMainWindow):
             icon = "👩" if v.gender == "female" else ("🧒" if v.gender == "child" else "👨")
             self.cb_voice_pick.addItem(f"{icon} {v.name}", encode_voice_spec(v))
 
+    def _sync_process_mode_ui(self):
+        pmode = self.cb_process_mode.currentData() or "dub_audio"
+        is_ocr_only = pmode == "ocr_sub_only"
+        is_ocr_any = pmode in ("ocr_sub_only", "ocr_sub_dub")
+
+        self.w_tts_section.setVisible(not is_ocr_only)
+        self.chk_demucs.setVisible(pmode == "dub_audio")
+        self.lbl_ocr_mode_tip.setVisible(is_ocr_any)
+
+        if is_ocr_only:
+            self.chk_blur.setChecked(True)
+            self.chk_burn.setChecked(True)
+            self.btn_analyze.setText("🔍 Bước 1: Quét chữ phụ đề & Dịch")
+            self.btn_render.setText("📝 Bước 2: Xóa sub cũ & Ghép phụ đề mới")
+        elif pmode == "ocr_sub_dub":
+            self.chk_blur.setChecked(True)
+            self.chk_burn.setChecked(True)
+            self.btn_analyze.setText("🔍 Bước 1: Quét chữ phụ đề & Dịch")
+            self.btn_render.setText("🎙 Bước 2: Lồng tiếng & Xuất Video")
+        else:
+            self.btn_analyze.setText("🔍 Bước 1: Phân tích, Nhận diện vai & Dịch")
+            self.btn_render.setText("🎙 Bước 2: Lồng tiếng & Xuất Video")
+
+        self._update_default_output()
+
     def _sync_tts_engine_ui(self):
         eng = self.cb_tts_engine.currentData() or "omnivoice"
         is_omni = eng == "omnivoice"
@@ -1812,13 +2185,19 @@ class MainWindow(QMainWindow):
         self.video_path = str(Path(path).resolve())
         self.video_info = info
         self.ed_input.setText(self.video_path)
-        self._update_default_output()
 
         dur = info["duration"]
         self.lbl_meta.setText(
             f"📐 {info['width']}×{info['height']}  ·  🎞 {info['fps']:.2f} fps  ·  "
-            f"⏱ {_fmt_mmss(dur)} ({dur:.1f}s)  ·  🔊 {'Có âm thanh' if info['has_audio'] else 'Không có âm thanh'}"
+            f"⏱ {_fmt_mmss(dur)} ({dur:.1f}s)  ·  🔊 {'Có âm thanh' if info['has_audio'] else 'Không có âm thanh (Chỉ hình)'}"
         )
+        if not info["has_audio"] and (self.cb_process_mode.currentData() or "dub_audio") == "dub_audio":
+            idx_ocr = self.cb_process_mode.findData("ocr_sub_only")
+            if idx_ocr >= 0:
+                self.cb_process_mode.setCurrentIndex(idx_ocr)
+                self._log("ℹ Video không có âm thanh — đã tự động chuyển sang chế độ 'Chỉ dịch phụ đề chữ trên video (OCR)'.")
+        self._update_default_output()
+
         if self._cap is not None:
             self._cap.release()
         self._cap = cv2.VideoCapture(self.video_path)
@@ -1828,9 +2207,21 @@ class MainWindow(QMainWindow):
         self._on_scrub(self.slider_time.value())
 
         proj = pipeline.load_project(self.video_path)
-        if proj and proj.get("segments"):
-            self._populate_table(proj["segments"])
-            self._log(f"📂 Đã tải lại bản dịch lưu sẵn ({len(proj['segments'])} câu thoại).")
+        if proj:
+            ps = proj.get("settings") or {}
+            if "sub_region_top" in ps and "sub_region_bottom" in ps:
+                self.preview.set_roi(
+                    float(ps.get("sub_region_left", 0.02)),
+                    float(ps.get("sub_region_top", 0.72)),
+                    float(ps.get("sub_region_right", 0.98)),
+                    float(ps.get("sub_region_bottom", 0.98)),
+                    emit=True,
+                )
+            if proj.get("segments"):
+                self._populate_table(proj["segments"])
+                self._log(f"📂 Đã tải lại bản dịch lưu sẵn ({len(proj['segments'])} câu).")
+            else:
+                self.table.setRowCount(0)
         else:
             self.table.setRowCount(0)
 
@@ -1838,8 +2229,10 @@ class MainWindow(QMainWindow):
         if not self.video_path:
             return
         tgt = self.cb_tgt.currentData() or "vi"
+        pmode = self.cb_process_mode.currentData() or "dub_audio"
+        suffix = "sub" if pmode == "ocr_sub_only" else "dub"
         vp = Path(self.video_path)
-        self.ed_output.setText(str(vp.with_name(f"{vp.stem}_{tgt}_dub.mp4")))
+        self.ed_output.setText(str(vp.with_name(f"{vp.stem}_{tgt}_{suffix}.mp4")))
 
     def _read_current_frame(self):
         if self._cap is None or not self.video_info:
@@ -1859,30 +2252,66 @@ class MainWindow(QMainWindow):
         if frame is not None:
             self._draw_scan_region_and_show(frame)
 
+    def _on_preview_roi_changed(self, left: float, top: float, right: float, bottom: float):
+        li = int(round(left * 100))
+        ti = int(round(top * 100))
+        ri = int(round(right * 100))
+        bi = int(round(bottom * 100))
+        for sp, val in (
+            (self.sp_reg_left, li),
+            (self.sp_reg_right, ri),
+            (self.sp_reg_top, ti),
+            (self.sp_reg_bot, bi),
+        ):
+            sp.blockSignals(True)
+            sp.setValue(val)
+            sp.blockSignals(False)
+        self.lbl_roi_info.setText(f"🎯 Khung quét: X {li}%→{ri}% · Y {ti}%→{bi}%")
+
+    def _reset_roi_box(self):
+        self.preview.set_roi(0.02, 0.72, 0.98, 0.98, emit=True)
+
     def _refresh_preview_overlay(self):
+        if self.sp_reg_left.value() >= self.sp_reg_right.value() - 7:
+            self.sp_reg_right.blockSignals(True)
+            self.sp_reg_right.setValue(min(100, self.sp_reg_left.value() + 8))
+            self.sp_reg_right.blockSignals(False)
         if self.sp_reg_top.value() >= self.sp_reg_bot.value() - 4:
+            self.sp_reg_bot.blockSignals(True)
             self.sp_reg_bot.setValue(min(100, self.sp_reg_top.value() + 5))
-        frame, _ = self._read_current_frame()
-        if frame is not None:
-            self._draw_scan_region_and_show(frame)
+            self.sp_reg_bot.blockSignals(False)
+        l = self.sp_reg_left.value() / 100.0
+        r = self.sp_reg_right.value() / 100.0
+        t = self.sp_reg_top.value() / 100.0
+        b = self.sp_reg_bot.value() / 100.0
+        self.preview.set_roi(l, t, r, b, emit=False)
+        self.lbl_roi_info.setText(
+            f"🎯 Khung quét: X {self.sp_reg_left.value()}%→{self.sp_reg_right.value()}% · "
+            f"Y {self.sp_reg_top.value()}%→{self.sp_reg_bot.value()}%"
+        )
 
     def _draw_scan_region_and_show(self, frame: np.ndarray):
-        vis = frame.copy()
-        h, w = vis.shape[:2]
-        y0 = int(self.sp_reg_top.value() / 100.0 * h)
-        y1 = int(self.sp_reg_bot.value() / 100.0 * h)
-        cv2.rectangle(vis, (4, y0), (w - 5, y1), (60, 220, 100), max(2, h // 300))
-        self.preview.set_frame(vis)
+        self.preview.set_frame(frame)
 
     def _preview_blur_frame(self):
         frame, t = self._read_current_frame()
         if frame is None:
             return
         try:
-            from dubber.subtitles import Blurrer, _get_detector, _merge_lines
+            from dubber.subtitles import (
+                Blurrer,
+                _detect_boxes_with_engine,
+                _get_ocr_engine,
+                _merge_lines,
+                get_roi_bounds,
+                recognize_crop_rapidocr,
+            )
 
             if self._ocr_detector is None:
-                self._ocr_detector = _get_detector()
+                self._ocr_detector = _get_ocr_engine()
+            engine = self._ocr_detector
+            settings = self._collect_settings()
+
             h, w = frame.shape[:2]
             scale = 1.0
             small = frame
@@ -1892,18 +2321,19 @@ class MainWindow(QMainWindow):
                 small = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_AREA)
                 scale = w / nw
             sh, sw = small.shape[:2]
-            y0 = int(self.sp_reg_top.value() / 100.0 * sh)
-            y1 = int(self.sp_reg_bot.value() / 100.0 * sh)
-            crop = small[y0:y1]
+            x0, y0, x1, y1 = get_roi_bounds(settings, sw, sh)
+            custom_x = (settings.sub_region_left > 0.05) or (settings.sub_region_right < 0.95)
+            crop = small[y0:y1, x0:x1]
             boxes = []
             if crop.size:
-                for x1, a, x2, b in self._ocr_detector(crop):
-                    bh = b - a
-                    bw = x2 - x1
-                    if 0.016 * sh <= bh <= 0.16 * sh and bw >= 0.9 * bh:
-                        boxes.append([x1, a + y0, x2, b + y0])
+                for bx1, by1, bx2, by2 in _detect_boxes_with_engine(engine, crop):
+                    bh = by2 - by1
+                    bw = bx2 - bx1
+                    if 0.015 * sh <= bh <= 0.24 * sh and bw >= 0.85 * bh:
+                        boxes.append([bx1 + x0, by1 + y0, bx2 + x0, by2 + y0])
 
-            blocks = _merge_lines(boxes, W=sw, H=sh) if boxes else []
+            blocks = _merge_lines(boxes, W=sw, H=sh, custom_x_roi=custom_x) if boxes else []
+            ocr_preview_txt = recognize_crop_rapidocr(engine, crop) if blocks else ""
             for B in blocks:
                 B["rect"] = [v * scale for v in B["rect"]]
                 B["line_h"] *= scale
@@ -1913,7 +2343,8 @@ class MainWindow(QMainWindow):
             for rx1, ry1, rx2, ry2 in blurrer.rects_at(0.0):
                 cv2.rectangle(out, (rx1, ry1), (rx2, ry2), (0, 210, 255), max(2, h // 360))
             self.preview.set_frame(out)
-            self._log(f"🔍 Xem thử xóa phụ đề tại {t:.2f}s: đã xử lý sạch {len(blocks)} cụm chữ.")
+            txt_hint = f' — Chữ OCR sơ bộ: "{ocr_preview_txt}"' if ocr_preview_txt else ""
+            self._log(f"🔍 Xem thử xóa phụ đề tại {t:.2f}s: đã xử lý sạch {len(blocks)} cụm chữ{txt_hint}.")
         except Exception as e:
             QMessageBox.warning(self, "Lỗi xem thử OCR", str(e))
 
@@ -1939,6 +2370,7 @@ class MainWindow(QMainWindow):
         cb = QComboBox()
         # Character role presets
         role_options = [
+            ("📝 Phụ đề OCR", ("female", "SUB_1", "📝 Phụ đề OCR", "auto")),
             ("👨 Nam 1 (Chính)", ("male", "NAM_1", "Nam 1", "auto")),
             ("👨 Nam 2 (Phụ/Trầm)", ("male", "NAM_2", "Nam 2", "auto")),
             ("👨 Nam 3", ("male", "NAM_3", "Nam 3", "auto")),
@@ -1946,7 +2378,7 @@ class MainWindow(QMainWindow):
             ("👩 Nữ 2 (Phụ/Trẻ)", ("female", "NU_2", "Nữ 2", "auto")),
             ("🧒 Trẻ em / Giọng cao", ("child", "TRE_1", "Trẻ em", "auto")),
         ]
-        selected_idx = 0
+        selected_idx = 1  # Default Nam 1 when unspecified
         for idx, (label, meta) in enumerate(role_options):
             cb.addItem(label, meta)
             if voice_ov in ("", "auto") and meta[1] == spk:
@@ -2031,7 +2463,9 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------ Single Video Execution
     def _collect_settings(self) -> Settings:
+        l, t, r, b = self.preview.get_roi()
         return Settings(
+            process_mode=self.cb_process_mode.currentData() or "dub_audio",
             source_lang=self.cb_src.currentData(),
             target_lang=self.cb_tgt.currentData(),
             whisper_model=self.cb_whisper.currentData(),
@@ -2054,8 +2488,10 @@ class MainWindow(QMainWindow):
             custom_voice=self.cb_voice_pick.currentData() or "",
             blur_old_subs=self.chk_blur.isChecked(),
             burn_new_subs=self.chk_burn.isChecked(),
-            sub_region_top=self.sp_reg_top.value() / 100.0,
-            sub_region_bottom=self.sp_reg_bot.value() / 100.0,
+            sub_region_left=float(l),
+            sub_region_right=float(r),
+            sub_region_top=float(t),
+            sub_region_bottom=float(b),
             ocr_fps=float(self.sp_ocr_fps.value()),
             blur_style=self.cb_blur_style.currentData(),
             sub_font_size=int(self.sp_fontsize.value()),
@@ -2064,6 +2500,8 @@ class MainWindow(QMainWindow):
         )
 
     def _validate_tts_settings(self, settings: Settings) -> bool:
+        if getattr(settings, "process_mode", "dub_audio") == "ocr_sub_only":
+            return True
         if settings.tts_engine == "omnivoice" and settings.omnivoice_preset == "clone_file":
             if not settings.omnivoice_ref_audio or not os.path.isfile(settings.omnivoice_ref_audio):
                 QMessageBox.warning(
@@ -2104,7 +2542,14 @@ class MainWindow(QMainWindow):
         out_path = self.ed_output.text().strip() or None
         self._set_running_ui(True)
         self._was_cancelled = False
-        self.prog_card.start(mode)
+        pmode = settings.process_mode
+        if pmode == "ocr_sub_only":
+            prog_mode = {"analyze": "analyze_ocr", "render": "render_ocr", "both": "both_ocr"}.get(mode, "both_ocr")
+        elif pmode == "ocr_sub_dub":
+            prog_mode = {"analyze": "analyze_ocr", "render": "render", "both": "both_ocr_dub"}.get(mode, "both_ocr_dub")
+        else:
+            prog_mode = mode
+        self.prog_card.start(prog_mode)
 
         self.worker = PipelineWorker(mode, self.video_path, settings, segs, out_path)
         self.worker.log_sig.connect(self._log)
@@ -2356,6 +2801,8 @@ class MainWindow(QMainWindow):
             "<li><b>Dịch kịch bản chuẩn văn phong:</b> Google Gemini AI (tự xoay vòng 8 Model Cao ➜ Thấp) & dự phòng NLLB-200 Offline</li>"
             "<li><b>Giọng đọc siêu thực OmniVoice AI:</b> Tự động Clone giọng gốc từng nhân vật, Clone từ file mẫu & Thiết kế giọng đa ngôn ngữ + Edge Neural TTS dự phòng</li>"
             "<li><b>Chống dính chữ:</b> Cân bằng nhịp Elastic Timeline + Khoảng nghỉ tự nhiên</li>"
+            "<li><b>Quét chữ phụ đề trên video không tiếng (OCR + Vision AI):</b> Trích xuất chữ sub hiển thị ➜ Dịch ➜ Xóa sạch sub cũ ➜ Ghép sub mới (tùy chọn giữ nguyên âm thanh hoặc lồng tiếng)</li>"
+            "<li><b>Khung quét phụ đề linh hoạt:</b> Kéo thả di chuyển và co giãn trực tiếp khung xanh trên màn hình xem trước vào đúng vị trí phụ đề</li>"
             "<li><b>Xóa sạch phụ đề cũ:</b> RapidOCR + Telea Stroke Inpainting & Cố định vị trí sub mới</li>"
             "<li><b>Bảo mật & Tự cập nhật:</b> Khóa thiết bị Firebase thời gian thực + GitHub Auto-Update</li>"
             "</ul>",
