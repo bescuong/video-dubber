@@ -310,8 +310,12 @@ def _temporal_stabilize(samples, W, H):
 
 def detect_subtitles(video, info, settings, log=print, progress=None):
     """Return list of samples: {"t": seconds, "blocks": [{"rect":[x1,y1,x2,y2], "line_h": px}]}
-    in full-resolution coordinates, scanned inside the user's movable 4-sided ROI."""
+    in full-resolution coordinates, scanned inside the user's movable 4-sided ROI with Smart Frame-Skip."""
+    from .hw_profile import get_hw_profile
+
     engine = _get_ocr_engine()
+    prof = get_hw_profile()
+    hw = prof.ffmpeg_hwaccel if getattr(settings, "use_gpu", True) else ""
     W, H = info["width"], info["height"]
     sfps = float(settings.ocr_fps)
     total = max(1, int(info["duration"] * sfps))
@@ -323,21 +327,52 @@ def detect_subtitles(video, info, settings, log=print, progress=None):
     )
 
     samples = []
-    for i, frame in read_frames(video, info["fps"], W, H, scale_width=OCR_WIDTH, sample_fps=sfps):
+    prev_thumb: np.ndarray | None = None
+    prev_boxes: list[list[float]] = []
+    skip_streak = 0
+    max_skip = max(2, int(round(sfps * 0.6)))  # re-verify at least ~every 0.6s
+    skip_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+
+    for i, frame in read_frames(video, info["fps"], W, H, scale_width=OCR_WIDTH, sample_fps=sfps, hwaccel=hw):
         h, w = frame.shape[:2]
         scale = W / w
         x0, y0, x1, y1 = get_roi_bounds(settings, w, h)
         crop = frame[y0:y1, x0:x1]
         boxes = []
         if crop.size:
-            for bx1, by1, bx2, by2 in _detect_boxes_with_engine(engine, crop):
-                bh = by2 - by1
-                bw = bx2 - bx1
-                if not (0.015 * h <= bh <= 0.22 * h):
-                    continue
-                if bw < 0.85 * bh:
-                    continue
-                boxes.append([bx1 + x0, by1 + y0, bx2 + x0, by2 + y0])
+            # Ultra-fast (0.08ms) stroke-energy pre-check: skips RapidOCR on empty or unchanged subtitle frames!
+            g_small = cv2.resize(cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY), (160, 36), interpolation=cv2.INTER_AREA)
+            stroke_e = cv2.add(
+                cv2.morphologyEx(g_small, cv2.MORPH_TOPHAT, skip_k),
+                cv2.morphologyEx(g_small, cv2.MORPH_BLACKHAT, skip_k),
+            ).astype(np.float32)
+
+            if float(np.percentile(stroke_e, 99.5)) < 14.0:
+                # Zero high-contrast text strokes in ROI -> skip neural OCR completely!
+                boxes = []
+                prev_thumb = stroke_e
+                prev_boxes = []
+                skip_streak = 0
+            elif (
+                prev_thumb is not None
+                and skip_streak < max_skip
+                and float(np.percentile(np.abs(stroke_e - prev_thumb), 99)) < 15.0
+            ):
+                # Subtitle strokes identical to previous frame -> reuse detected boxes!
+                boxes = [list(b) for b in prev_boxes]
+                skip_streak += 1
+            else:
+                for bx1, by1, bx2, by2 in _detect_boxes_with_engine(engine, crop):
+                    bh = by2 - by1
+                    bw = bx2 - bx1
+                    if not (0.015 * h <= bh <= 0.22 * h):
+                        continue
+                    if bw < 0.85 * bh:
+                        continue
+                    boxes.append([bx1 + x0, by1 + y0, bx2 + x0, by2 + y0])
+                prev_thumb = stroke_e
+                prev_boxes = [list(b) for b in boxes]
+                skip_streak = 0
 
         blocks = _merge_lines(boxes, W=w, H=h, custom_x_roi=custom_x) if boxes else []
         for B in blocks:
@@ -451,7 +486,11 @@ def extract_ocr_subtitles(
 
     Returns `(segments, samples, detected_lang_code)`.
     """
+    from .hw_profile import get_hw_profile
+
     engine = _get_ocr_engine()
+    prof = get_hw_profile()
+    hw = prof.ffmpeg_hwaccel if getattr(settings, "use_gpu", True) else ""
     W, H = info["width"], info["height"]
     dur = float(info["duration"])
     sfps = max(3.0, float(getattr(settings, "ocr_fps", 5.0)))
@@ -469,8 +508,13 @@ def extract_ocr_subtitles(
     raw_events: list[dict] = []
     cur_ev: dict | None = None
     miss_streak = 0
+    prev_thumb: np.ndarray | None = None
+    prev_boxes: list[list[float]] = []
+    skip_streak = 0
+    max_skip = max(2, int(round(sfps * 0.6)))
+    skip_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
 
-    for i, frame in read_frames(video, info["fps"], W, H, scale_width=OCR_WIDTH, sample_fps=sfps):
+    for i, frame in read_frames(video, info["fps"], W, H, scale_width=OCR_WIDTH, sample_fps=sfps, hwaccel=hw):
         if cancelled and cancelled():
             raise InterruptedError("Đã hủy")
 
@@ -482,14 +526,36 @@ def extract_ocr_subtitles(
 
         boxes = []
         if crop_roi.size:
-            for bx1, by1, bx2, by2 in _detect_boxes_with_engine(engine, crop_roi):
-                bh = by2 - by1
-                bw = bx2 - bx1
-                if not (0.015 * h <= bh <= 0.24 * h):
-                    continue
-                if bw < 0.85 * bh:
-                    continue
-                boxes.append([bx1 + x0, by1 + y0, bx2 + x0, by2 + y0])
+            g_small = cv2.resize(cv2.cvtColor(crop_roi, cv2.COLOR_BGR2GRAY), (160, 36), interpolation=cv2.INTER_AREA)
+            stroke_e = cv2.add(
+                cv2.morphologyEx(g_small, cv2.MORPH_TOPHAT, skip_k),
+                cv2.morphologyEx(g_small, cv2.MORPH_BLACKHAT, skip_k),
+            ).astype(np.float32)
+
+            if float(np.percentile(stroke_e, 99.5)) < 14.0:
+                boxes = []
+                prev_thumb = stroke_e
+                prev_boxes = []
+                skip_streak = 0
+            elif (
+                prev_thumb is not None
+                and skip_streak < max_skip
+                and float(np.percentile(np.abs(stroke_e - prev_thumb), 99)) < 15.0
+            ):
+                boxes = [list(b) for b in prev_boxes]
+                skip_streak += 1
+            else:
+                for bx1, by1, bx2, by2 in _detect_boxes_with_engine(engine, crop_roi):
+                    bh = by2 - by1
+                    bw = bx2 - bx1
+                    if not (0.015 * h <= bh <= 0.24 * h):
+                        continue
+                    if bw < 0.85 * bh:
+                        continue
+                    boxes.append([bx1 + x0, by1 + y0, bx2 + x0, by2 + y0])
+                prev_thumb = stroke_e
+                prev_boxes = [list(b) for b in boxes]
+                skip_streak = 0
 
         blocks = _merge_lines(boxes, W=w, H=h, custom_x_roi=custom_x) if boxes else []
         full_blocks = [

@@ -3,6 +3,8 @@
 Stage 1  analyze(): extract audio -> separate vocals -> speech recognition -> translation -> speaker/character analysis
 Stage 2  render():  TTS fitted to timing -> mix with background -> OCR old subs -> erase/cover + new subs -> mp4
 """
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 import subprocess
@@ -88,6 +90,7 @@ def _match_lang_code(code: str, fallback: str = "en") -> str:
 def analyze(video, settings: Settings, cb: Callbacks = None):
     cb = cb or Callbacks()
     t0 = time.time()
+    stage_times: list[str] = []
     video = str(Path(video).resolve())
     wd = work_dir(video)
     info = media.probe(video)
@@ -101,6 +104,7 @@ def analyze(video, settings: Settings, cb: Callbacks = None):
 
     if mode in ("ocr_sub_only", "ocr_sub_dub"):
         # OCR-First Branch: scan burned-in text directly from movable ROI (works on silent or BGM-only videos!)
+        ts = time.time()
         p = cb.stage(STAGE_OCR)
         from . import subtitles
         acc_key = ""
@@ -129,6 +133,7 @@ def analyze(video, settings: Settings, cb: Callbacks = None):
             )
         except Exception:
             pass
+        stage_times.append(f"Quét OCR {time.time() - ts:.1f}s")
         p(1.0)
         cb.check()
         if not segs:
@@ -138,6 +143,7 @@ def analyze(video, settings: Settings, cb: Callbacks = None):
             )
     else:
         # 1. Audio extraction & Demucs separation (cached)
+        ts = time.time()
         p = cb.stage(STAGE_SEPARATE)
         vocals_p, bg_p = wd / "vocals.wav", wd / "background.wav"
         if settings.separate_vocals:
@@ -157,10 +163,12 @@ def analyze(video, settings: Settings, cb: Callbacks = None):
             asr_src = vocals_p
         else:
             asr_src = video
+        stage_times.append(f"Tách nhạc {time.time() - ts:.1f}s")
         p(1.0)
         cb.check()
 
         # 2. Speech recognition (Whisper)
+        ts = time.time()
         p = cb.stage(STAGE_ASR)
         wav16 = wd / "asr16k.wav"
         media.run(["ffmpeg", "-v", "error", "-y", "-i", str(asr_src), "-ac", "1", "-ar", "16000", str(wav16)])
@@ -170,6 +178,7 @@ def analyze(video, settings: Settings, cb: Callbacks = None):
             wav16, settings.whisper_model, lang, settings.use_gpu, cb.log, p, info["duration"]
         )
         cb.log(f"Nhận dạng được {len(segs)} câu thoại")
+        stage_times.append(f"Whisper {time.time() - ts:.1f}s")
         cb.check()
         if not segs:
             raise RuntimeError(
@@ -179,6 +188,7 @@ def analyze(video, settings: Settings, cb: Callbacks = None):
             )
 
         # 3. Speaker Gender / Age / Multi-Character Diarization (runs BEFORE translation so AI knows speaker roles!)
+        ts = time.time()
         p = cb.stage(STAGE_DIARIZE)
         try:
             from .gender import analyze_speakers
@@ -197,10 +207,12 @@ def analyze(video, settings: Settings, cb: Callbacks = None):
                 s["gender"] = "male"
                 s["speaker"] = "NAM_1"
                 s["speaker_label"] = "Nam 1"
+        stage_times.append(f"Phân vai {time.time() - ts:.1f}s")
         p(1.0)
         cb.check()
 
     # 4. Script Translation (Gemini AI High->Low Cascade or Offline NLLB-200)
+    ts = time.time()
     p = cb.stage(STAGE_TRANSLATE)
     src_code = _match_lang_code(detected, fallback=(settings.source_lang if settings.source_lang != "auto" else "en"))
     if detected not in LANGUAGES and src_code != detected:
@@ -253,9 +265,11 @@ def analyze(video, settings: Settings, cb: Callbacks = None):
 
     for s, t in zip(segs, translations):
         s["translation"] = t
+    stage_times.append(f"Dịch {time.time() - ts:.1f}s")
     cb.check()
 
     save_project(video, settings, segs, src_code)
+    cb.log(f"⏱ Thống kê tốc độ: {' · '.join(stage_times)}")
     cb.log(f"✔ Hoàn tất phân tích sau {time.time() - t0:.0f}s. Bạn có thể kiểm tra/sửa lời dịch trước khi xuất.")
     return segs, src_code
 
@@ -298,28 +312,58 @@ def _mix(dub, wd, info, settings, video, cb):
     return out.astype(np.float32)
 
 
-def _pick_encoder(use_gpu):
-    if use_gpu:
+_CACHED_GPU_ENCODER: str | None = None
+
+
+def _pick_encoder(use_gpu: bool, W: int = 1920, H: int = 1080) -> str:
+    global _CACHED_GPU_ENCODER
+    if not use_gpu or W > 4096 or H > 4096:
+        return "libx264"
+    if _CACHED_GPU_ENCODER is not None:
+        return _CACHED_GPU_ENCODER
+
+    # Probe native GPU encoders first, then Windows MediaFoundation Hardware MFT (`h264_mf`),
+    # which activates NVIDIA NVENC / AMD AMF / Intel QSV on ALL Windows driver versions!
+    candidates = [
+        ("h264_nvenc", ["-c:v", "h264_nvenc", "-pix_fmt", "yuv420p"]),
+        ("h264_amf", ["-c:v", "h264_amf", "-pix_fmt", "yuv420p"]),
+        ("h264_qsv", ["-c:v", "h264_qsv", "-pix_fmt", "nv12"]),
+        ("h264_mf", ["-c:v", "h264_mf", "-hw_encoding", "true", "-rate_control", "u_vbr", "-b:v", "4000k", "-pix_fmt", "nv12"]),
+    ]
+    for enc_name, enc_test_args in candidates:
         try:
             media.run([
-                "ffmpeg", "-v", "error", "-f", "lavfi", "-i", "color=s=320x240:d=0.2",
-                "-c:v", "h264_nvenc", "-f", "null", "-"
+                "ffmpeg", "-v", "error", "-f", "lavfi", "-i", "color=s=640x360:d=0.2:r=25",
+                *enc_test_args, "-f", "mp4", os.devnull, "-y"
             ])
-            return "h264_nvenc"
+            _CACHED_GPU_ENCODER = enc_name
+            return enc_name
         except Exception:
-            pass
+            continue
+
+    _CACHED_GPU_ENCODER = "libx264"
     return "libx264"
 
 
-def _enc_args(encoder, crf):
+def _enc_args(encoder: str, crf: int, W: int = 1920, H: int = 1080, fps: float = 30.0) -> list[str]:
     if encoder == "h264_nvenc":
-        return ["-c:v", "h264_nvenc", "-preset", "p5", "-rc", "vbr", "-cq", str(crf + 1), "-b:v", "0"]
-    return ["-c:v", "libx264", "-preset", "medium", "-crf", str(crf)]
+        return ["-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", str(crf + 1), "-b:v", "0", "-pix_fmt", "yuv420p"]
+    if encoder == "h264_amf":
+        return ["-c:v", "h264_amf", "-quality", "balanced", "-rc", "cqp", "-qp_i", str(crf), "-qp_p", str(crf + 1), "-pix_fmt", "yuv420p"]
+    if encoder == "h264_qsv":
+        return ["-c:v", "h264_qsv", "-preset", "faster", "-global_quality", str(crf + 1), "-pix_fmt", "nv12"]
+    if encoder == "h264_mf":
+        # Windows Hardware MFT (NVIDIA H.264 Encoder MFT / AMD / Intel QSV): scale VBR bitrate cleanly by resolution
+        bpp = 0.12 * (2.0 ** ((20.0 - float(crf)) / 6.0))
+        kbps = int(np.clip(W * H * min(float(fps or 30.0), 60.0) * bpp / 1000.0, 2500, 28000))
+        return ["-c:v", "h264_mf", "-hw_encoding", "true", "-rate_control", "u_vbr", "-b:v", f"{kbps}k", "-pix_fmt", "nv12"]
+    return ["-c:v", "libx264", "-preset", "veryfast", "-crf", str(crf), "-pix_fmt", "yuv420p"]
 
 
 def render(video, settings: Settings, segments, cb: Callbacks = None, output=None):
     cb = cb or Callbacks()
     t0 = time.time()
+    stage_times: list[str] = []
     video = str(Path(video).resolve())
     wd = work_dir(video)
     info = media.probe(video)
@@ -327,11 +371,14 @@ def render(video, settings: Settings, segments, cb: Callbacks = None, output=Non
     tgt = LANGUAGES.get(settings.target_lang, LANGUAGES["vi"])
     mode = getattr(settings, "process_mode", "dub_audio")
     need_tts = mode in ("dub_audio", "ocr_sub_dub")
+    from .hw_profile import get_hw_profile
+    prof = get_hw_profile()
     save_project(video, settings, segments, (load_project(video) or {}).get("source_lang", "auto"))
 
     audio_p = None
     if need_tts:
         # 1. TTS with OmniVoice AI (Zero-Shot Clone / Voice Design) or Edge Neural TTS + Elastic Timeline
+        ts = time.time()
         p = cb.stage(STAGE_TTS)
         from .gender import resolve_voice_for_segment
         from . import omnivoice_tts
@@ -344,7 +391,7 @@ def render(video, settings: Settings, segments, cb: Callbacks = None, output=Non
         if want_omni and not omnivoice_tts.is_omnivoice_available():
             cb.log(
                 "⚠ Phiên bản cài đặt hiện tại chưa tích hợp gói thư viện OmniVoice AI — "
-                "tự động chuyển sang Edge Neural TTS (vui lòng chạy file Setup v2.3.0 để dùng OmniVoice)."
+                "tự động chuyển sang Edge Neural TTS (vui lòng chạy file Setup v2.4.0 để dùng OmniVoice)."
             )
             want_omni = False
 
@@ -383,16 +430,19 @@ def render(video, settings: Settings, segments, cb: Callbacks = None, output=Non
                 progress=p,
                 cancelled=cb.cancelled,
             )
+        stage_times.append(f"Giọng đọc {time.time() - ts:.1f}s")
         fast = sum(1 for t in tinfo if t["speed"] > settings.max_speedup * 1.05)
         if fast:
             cb.log(f"ℹ Có {fast} câu thoại dịch khá dài đã được tự động cân chỉnh giãn nhịp.")
         cb.check()
 
         # 2. Mix Audio
+        ts = time.time()
         p = cb.stage(STAGE_MIX)
         mix = _mix(dub, wd, info, settings, video, cb)
         audio_p = wd / "dub_audio.wav"
         media.save_wav(audio_p, mix, SR)
+        stage_times.append(f"Trộn nhạc {time.time() - ts:.1f}s")
         p(1.0)
         cb.check()
     else:
@@ -405,6 +455,7 @@ def render(video, settings: Settings, segments, cb: Callbacks = None, output=Non
     # 3. Old Subtitle Detection (OCR inside movable 4-sided ROI)
     samples = []
     if settings.blur_old_subs or (settings.burn_new_subs and settings.sub_place_on_old):
+        ts = time.time()
         p = cb.stage(STAGE_OCR)
         from .subtitles import detect_subtitles, roi_cache_key
         key = roi_cache_key(settings)
@@ -421,6 +472,7 @@ def render(video, settings: Settings, segments, cb: Callbacks = None, output=Non
         else:
             samples = detect_subtitles(video, info, settings, cb.log, p)
             cache.write_text(json.dumps({"key": key, "samples": samples}), encoding="utf-8")
+        stage_times.append(f"OCR {time.time() - ts:.1f}s")
         p(1.0)
         cb.check()
 
@@ -433,35 +485,43 @@ def render(video, settings: Settings, segments, cb: Callbacks = None, output=Non
         encoding="utf-8-sig",
     )
 
-    # 5. Video Encode & Subtitle Burn (supports dubbed audio, original BGM audio, or silent video!)
+    # 5. Video Encode & Subtitle Burn (GPU hwaccel decode + Multi-threaded Blurrer + GPU NVENC/AMF/QSV encode!)
+    ts = time.time()
     p = cb.stage(STAGE_RENDER)
     suffix = "sub" if mode == "ocr_sub_only" else "dub"
     out = Path(output) if output else Path(video).with_name(f"{Path(video).stem}_{settings.target_lang}_{suffix}.mp4")
     out = out.resolve()
-    encoder = _pick_encoder(settings.use_gpu)
-    cb.log(f"Mã hóa video đầu ra bằng {encoder}")
+    encoder = _pick_encoder(settings.use_gpu, W, H)
+    enc_flags = _enc_args(encoder, settings.video_crf, W, H, info["fps"])
+    hwaccel = prof.ffmpeg_hwaccel if settings.use_gpu else ""
     vf = [f"subtitles={ass_name}"] if settings.burn_new_subs else []
     use_blur = settings.blur_old_subs and any(s["blocks"] for s in samples)
+    enc_label = f"{encoder} (GPU Hardware MFT)" if encoder == "h264_mf" else encoder
+    extra_enc_note = f" · giải mã {hwaccel} · {prof.blur_workers} luồng xóa sub" if (use_blur and hwaccel) else ""
+    cb.log(f"Mã hóa video đầu ra bằng {enc_label}{extra_enc_note}")
     dur_sec = max(0.1, float(info["duration"]))
     log_f = open(wd / "ffmpeg_render.log", "wb")
     try:
         if not use_blur:
-            cmd = ["ffmpeg", "-y", "-progress", "pipe:1", "-nostats", "-i", video]
+            cmd = ["ffmpeg", "-y", "-progress", "pipe:1", "-nostats"]
+            if hwaccel:
+                cmd += ["-hwaccel", "auto"]
+            cmd += ["-i", video]
             if audio_p is not None:
                 cmd += ["-i", str(audio_p)]
             if vf:
                 cmd += ["-vf", ",".join(vf)]
             if audio_p is not None:
-                cmd += ["-map", "0:v:0", "-map", "1:a:0"] + _enc_args(encoder, settings.video_crf) + [
-                    "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-shortest", "-movflags", "+faststart", str(out)
+                cmd += ["-map", "0:v:0", "-map", "1:a:0"] + enc_flags + [
+                    "-c:a", "aac", "-b:a", "192k", "-shortest", "-movflags", "+faststart", str(out)
                 ]
             elif info["has_audio"]:
-                cmd += ["-map", "0:v:0", "-map", "0:a:0"] + _enc_args(encoder, settings.video_crf) + [
-                    "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(out)
+                cmd += ["-map", "0:v:0", "-map", "0:a:0"] + enc_flags + [
+                    "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(out)
                 ]
             else:
-                cmd += ["-map", "0:v:0", "-an"] + _enc_args(encoder, settings.video_crf) + [
-                    "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(out)
+                cmd += ["-map", "0:v:0", "-an"] + enc_flags + [
+                    "-movflags", "+faststart", str(out)
                 ]
 
             proc = subprocess.Popen(
@@ -497,32 +557,62 @@ def render(video, settings: Settings, segments, cb: Callbacks = None, output=Non
             if vf:
                 cmd += ["-vf", ",".join(vf)]
             if audio_p is not None:
-                cmd += ["-map", "0:v:0", "-map", "1:a:0"] + _enc_args(encoder, settings.video_crf) + [
-                    "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-shortest", "-movflags", "+faststart", str(out)
+                cmd += ["-map", "0:v:0", "-map", "1:a:0"] + enc_flags + [
+                    "-c:a", "aac", "-b:a", "192k", "-shortest", "-movflags", "+faststart", str(out)
                 ]
             elif info["has_audio"]:
-                cmd += ["-map", "0:v:0", "-map", "1:a:0"] + _enc_args(encoder, settings.video_crf) + [
-                    "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-shortest", "-movflags", "+faststart", str(out)
+                cmd += ["-map", "0:v:0", "-map", "1:a:0"] + enc_flags + [
+                    "-c:a", "aac", "-b:a", "192k", "-shortest", "-movflags", "+faststart", str(out)
                 ]
             else:
-                cmd += ["-map", "0:v:0", "-an"] + _enc_args(encoder, settings.video_crf) + [
-                    "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(out)
+                cmd += ["-map", "0:v:0", "-an"] + enc_flags + [
+                    "-movflags", "+faststart", str(out)
                 ]
 
             proc = subprocess.Popen(
                 cmd, cwd=str(wd), stdin=subprocess.PIPE, stderr=log_f,
-                stdout=subprocess.DEVNULL, creationflags=CREATE_NO_WINDOW
+                stdout=subprocess.DEVNULL, creationflags=CREATE_NO_WINDOW,
+                bufsize=W * H * 3 * 2,
             )
             total = max(1, int(info["duration"] * info["fps"]))
             fps = info["fps"]
+            n_workers = max(1, int(prof.blur_workers))
+            max_inflight = n_workers * 2
+
+            def _process_frame_bytes(frm_copy, t_sec: float) -> bytes:
+                return blur.apply(frm_copy, t_sec).tobytes()
+
             try:
-                for i, frame in media.read_frames(video, fps_str, W, H):
-                    proc.stdin.write(blur.apply(frame, i / fps).tobytes())
-                    if i % 15 == 0:
-                        p(min(0.99, i / total))
-                        if cb.cancelled():
-                            proc.kill()
-                            raise InterruptedError("Đã hủy")
+                with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                    pending_q = deque()
+                    written = 0
+                    for i, frame in media.read_frames(video, fps_str, W, H, hwaccel=hwaccel):
+                        t_sec = i / fps
+                        if not blur.rects_at(t_sec):
+                            # Fast path: no subtitle on this frame -> zero copy/blur overhead!
+                            raw_b = frame.tobytes()
+                            pending_q.append(pool.submit(lambda b=raw_b: b))
+                        else:
+                            # Copy buffer slice before read_frames advances & process in parallel C++ threads
+                            pending_q.append(pool.submit(_process_frame_bytes, frame.copy(), t_sec))
+
+                        if len(pending_q) >= max_inflight:
+                            proc.stdin.write(pending_q.popleft().result())
+                            written += 1
+                            if written % 15 == 0:
+                                p(min(0.99, written / total))
+                                if cb.cancelled():
+                                    proc.kill()
+                                    raise InterruptedError("Đã hủy")
+
+                    while pending_q:
+                        proc.stdin.write(pending_q.popleft().result())
+                        written += 1
+                        if written % 15 == 0:
+                            p(min(0.99, written / total))
+                            if cb.cancelled():
+                                proc.kill()
+                                raise InterruptedError("Đã hủy")
             finally:
                 try:
                     proc.stdin.close()
@@ -535,6 +625,8 @@ def render(video, settings: Settings, segments, cb: Callbacks = None, output=Non
     if proc.returncode != 0:
         tail = (wd / "ffmpeg_render.log").read_text("utf-8", "ignore")[-2000:]
         raise RuntimeError("FFmpeg lỗi khi xuất video:\n" + tail)
+    stage_times.append(f"Xuất video {time.time() - ts:.1f}s")
     p(1.0)
+    cb.log(f"⏱ Thống kê tốc độ: {' · '.join(stage_times)}")
     cb.log(f"✔ Hoàn tất xuất video sau {time.time() - t0:.0f}s: {out}")
     return str(out)

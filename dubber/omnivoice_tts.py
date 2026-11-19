@@ -157,10 +157,15 @@ def _resample_to_sr(y: np.ndarray, src_sr: int, dst_sr: int = SR) -> np.ndarray:
 
 
 def _load_omnivoice(use_gpu: bool = True, log: Callable[[str], None] = print):
-    """Load k2-fsa/OmniVoice safely with low-VRAM GTX 1060 3GB optimization."""
+    """Load k2-fsa/OmniVoice safely with automatic VRAM-tier tuning (3GB..24GB) & TF32 Tensor Cores."""
     _ensure_safe_streams()
     import torch
     from omnivoice import OmniVoice
+    from .hw_profile import apply_torch_cuda_optimizations, configure_cpu_threads, get_hw_profile
+
+    prof = get_hw_profile()
+    if use_gpu and prof.driver_outdated and prof.driver_warning:
+        log(prof.driver_warning)
 
     want_gpu = bool(use_gpu and torch.cuda.is_available())
     cache_key = "cuda" if want_gpu else "cpu"
@@ -168,25 +173,28 @@ def _load_omnivoice(use_gpu: bool = True, log: Callable[[str], None] = print):
     if cached is not None:
         return cached
 
-    # Unload any model on the opposite device first
     unload_omnivoice()
 
     src = _resolve_model_source()
     if want_gpu:
         try:
+            apply_torch_cuda_optimizations()
             gc.collect()
             torch.cuda.empty_cache()
             vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
             gpu_name = torch.cuda.get_device_name(0)
-            log(f"Đang tải mô hình giọng đọc OmniVoice AI trên GPU ({gpu_name}, {vram_gb:.1f} GB VRAM)...")
+            log(
+                f"Đang tải mô hình giọng đọc OmniVoice AI trên GPU "
+                f"({gpu_name}, {vram_gb:.1f} GB VRAM, batch={prof.omni_batch_size})..."
+            )
             model = OmniVoice.from_pretrained(
                 src,
                 device_map="cuda:0",
                 dtype=torch.float16,
                 load_asr=False,
             )
-            # On 3-4GB GPUs (e.g. GTX 1060 3GB), keep audio tokenizer on CPU -> peak ~1.17 GB VRAM!
-            if vram_gb < 5.0 and getattr(model, "audio_tokenizer", None) is not None:
+            # On <5GB GPUs (e.g. GTX 1060 3GB), keep audio tokenizer on CPU -> peak ~1.17 GB VRAM!
+            if prof.omni_tokenizer_cpu and getattr(model, "audio_tokenizer", None) is not None:
                 model.audio_tokenizer.to("cpu")
                 torch.cuda.empty_cache()
             model.eval()
@@ -200,7 +208,8 @@ def _load_omnivoice(use_gpu: bool = True, log: Callable[[str], None] = print):
             except Exception:
                 pass
 
-    log("Đang tải mô hình giọng đọc OmniVoice AI trên CPU...")
+    configure_cpu_threads(prof)
+    log(f"Đang tải mô hình giọng đọc OmniVoice AI trên CPU ({prof.cpu_threads} luồng)...")
     model = OmniVoice.from_pretrained(
         src,
         device_map="cpu",
@@ -547,43 +556,38 @@ def synthesize_track_omnivoice(
         if progress:
             progress(0.10)
 
-        # 2. Single-Pass Generation with Instant Duration-Aware Speed Control + Consistency Locking
-        audios: list[np.ndarray] = []
-        speeds: list[float] = []
+        # 2. Batched Parallel GPU Synthesis + Voice Consistency Locking + OOM-Safe Fallback
+        import torch
+        from .hw_profile import get_hw_profile
+
+        prof = get_hw_profile()
+        batch_size = prof.omni_batch_size if (use_gpu and torch.cuda.is_available()) else 1
         n_segs = len(segs)
+        audios: list[np.ndarray | None] = [None] * n_segs
+        speeds: list[float] = [1.0] * n_segs
+        done_count = 0
 
-        for i, s in enumerate(segs):
-            if cancelled and cancelled():
-                raise InterruptedError("Đã hủy")
+        def _bump_prog(inc: int = 1):
+            nonlocal done_count
+            done_count += inc
+            if progress:
+                progress(0.10 + 0.85 * min(1.0, done_count / max(1, n_segs)))
 
+        def _resolve_seg_meta(i: int, s: dict):
             txt = sanitize_tts_text(s["translation"])
             spk = s.get("speaker") or ("NU_1" if s.get("gender") == "female" else "NAM_1")
-
-            # Resolve prompt vs instruct for this segment
-            prompt = None
-            instruct = None
-            spk_key = spk
-
             if global_prompt is not None:
-                prompt = global_prompt
                 spk_key = "GLOBAL_FILE"
-            elif preset == "clone_auto" and spk in speaker_prompts:
-                prompt = speaker_prompts[spk]
+                instruct = None
             elif preset in ("clone_auto", "design_auto"):
-                if spk in speaker_prompts:
-                    prompt = speaker_prompts[spk]
-                else:
-                    instruct = _instruct_for_speaker(s, target_lang)
+                spk_key = spk
+                instruct = _instruct_for_speaker(s, target_lang)
             else:
-                # Fixed single voice design preset -> lock across the whole video using key "GLOBAL_PRESET"
                 spk_key = f"PRESET_{preset}"
-                if spk_key in speaker_prompts:
-                    prompt = speaker_prompts[spk_key]
-                else:
-                    _, raw_inst, _ = _PRESET_MAP.get(preset, ("", "female, young adult, moderate pitch", "female"))
-                    instruct = _apply_locale_accent(raw_inst, target_lang)
+                _, raw_inst, _ = _PRESET_MAP.get(preset, ("", "female, young adult, moderate pitch", "female"))
+                instruct = _apply_locale_accent(raw_inst, target_lang)
 
-            # Compute natural slot budget BEFORE synthesizing (avoids slow 2nd pass!)
+            prompt_now = global_prompt if global_prompt is not None else speaker_prompts.get(spk_key)
             orig_start = float(s["start"])
             orig_end = float(s["end"])
             next_start = float(segs[i + 1]["start"]) if (i + 1 < n_segs) else total_duration
@@ -591,61 +595,153 @@ def synthesize_track_omnivoice(
             slot_budget = max(orig_end - orig_start, min(base_avail + 0.18, (orig_end - orig_start) + 0.65))
             slot_budget = min(slot_budget, max(0.30, base_avail + 0.22))
 
-            est_dur = _estimate_duration_sec(model, txt, prompt)
+            est_dur = _estimate_duration_sec(model, txt, prompt_now)
             need = est_dur / max(0.28, slot_budget)
-            # OmniVoice sounds crisply natural up to ~1.38x speed; let gentle atempo handle tiny overflow
-            gen_speed = 1.0
-            if need > 1.06:
-                gen_speed = float(np.clip(need * 1.02, 1.0, min(max_speedup, 1.38)))
-            speeds.append(need)
-
+            gen_speed = float(np.clip(need * 1.02, 1.0, min(max_speedup, 1.38))) if need > 1.06 else 1.0
+            speeds[i] = need
             cache_key = f"ov2|{ref_sig}|{spk_key}|{lang_code}|{steps}|{gen_speed:.2f}|{txt}"
             cache_p = _ov_cache_path(cache_dir, cache_key)
+            return {
+                "idx": i,
+                "txt": txt,
+                "spk_key": spk_key,
+                "instruct": instruct,
+                "gen_speed": gen_speed,
+                "cache_p": cache_p,
+            }
 
-            y_44k = None
-            if os.path.exists(cache_p) and os.path.getsize(cache_p) > 256:
+        # Pass 2A: Build metadata & load any disk-cached utterances immediately
+        pending_items: list[dict] = []
+        for i, s in enumerate(segs):
+            if cancelled and cancelled():
+                raise InterruptedError("Đã hủy")
+            it = _resolve_seg_meta(i, s)
+            cp = it["cache_p"]
+            if os.path.exists(cp) and os.path.getsize(cp) > 256:
                 try:
-                    y_44k = _trim_silence(load_audio(cache_p, SR, 1)[0])
-                    if prompt is None and len(y_44k) >= int(1.0 * SR):
-                        locked = _make_prompt_safe(model, _resample_to_sr(y_44k, SR, sr_out), sr_out, txt)
+                    y_cached = _trim_silence(load_audio(cp, SR, 1)[0])
+                    audios[i] = y_cached
+                    if global_prompt is None and it["spk_key"] not in speaker_prompts and len(y_cached) >= int(1.0 * SR):
+                        locked = _make_prompt_safe(model, _resample_to_sr(y_cached, SR, sr_out), sr_out, it["txt"])
                         if locked is not None:
-                            speaker_prompts[spk_key] = locked
+                            speaker_prompts[it["spk_key"]] = locked
+                    _bump_prog(1)
+                    continue
                 except Exception:
-                    y_44k = None
+                    pass
+            pending_items.append(it)
 
-            if y_44k is None:
-                try:
-                    raw_list = model.generate(
-                        text=txt,
-                        language=lang_code,
-                        voice_clone_prompt=prompt,
-                        instruct=instruct if prompt is None else None,
-                        speed=gen_speed if abs(gen_speed - 1.0) > 0.03 else None,
-                        num_step=steps,
-                        denoise=True,
-                        postprocess_output=True,
-                    )
-                    raw_24k = np.asarray(raw_list[0], dtype=np.float32).reshape(-1)
+        def _synth_single_item(it: dict):
+            if cancelled and cancelled():
+                raise InterruptedError("Đã hủy")
+            idx = it["idx"]
+            spk_key = it["spk_key"]
+            prompt = global_prompt if global_prompt is not None else speaker_prompts.get(spk_key)
+            try:
+                raw_list = model.generate(
+                    text=it["txt"],
+                    language=lang_code,
+                    voice_clone_prompt=prompt,
+                    instruct=it["instruct"] if prompt is None else None,
+                    speed=it["gen_speed"] if abs(it["gen_speed"] - 1.0) > 0.03 else None,
+                    num_step=steps,
+                    denoise=True,
+                    postprocess_output=True,
+                )
+                raw_24k = np.asarray(raw_list[0], dtype=np.float32).reshape(-1)
+                if prompt is None and len(raw_24k) >= int(0.9 * sr_out):
+                    locked = _make_prompt_safe(model, raw_24k, sr_out, it["txt"])
+                    if locked is not None:
+                        speaker_prompts[spk_key] = locked
+                y_44k = _trim_silence(_resample_to_sr(raw_24k, sr_out, SR))
+                if len(y_44k) > 0:
+                    save_wav(it["cache_p"], y_44k[None, :], SR)
+                audios[idx] = y_44k
+            except Exception as e:
+                log(f"  ⚠ OmniVoice bỏ qua câu {idx + 1} ('{it['txt'][:40]}') do lỗi: {e}")
+                audios[idx] = np.zeros(0, np.float32)
+            _bump_prog(1)
 
-                    # Voice Design Consistency Lock: capture first utterance as VoiceClonePrompt for this speaker!
-                    if prompt is None and len(raw_24k) >= int(1.0 * sr_out):
-                        locked = _make_prompt_safe(model, raw_24k, sr_out, txt)
-                        if locked is not None:
-                            speaker_prompts[spk_key] = locked
+        # Pass 2B: Lock voice identity on the first utterance of any un-prompted speaker (1-3 items max)
+        still_pending: list[dict] = []
+        for it in pending_items:
+            spk_key = it["spk_key"]
+            has_prompt = (global_prompt is not None) or (spk_key in speaker_prompts)
+            if not has_prompt:
+                _synth_single_item(it)
+            else:
+                still_pending.append(it)
 
-                    y_44k = _trim_silence(_resample_to_sr(raw_24k, sr_out, SR))
-                    if len(y_44k) > 0:
-                        save_wav(cache_p, y_44k[None, :], SR)
-                except Exception as e:
-                    log(f"  ⚠ OmniVoice bỏ qua câu {i + 1} ('{txt[:40]}') do lỗi: {e}")
-                    y_44k = np.zeros(0, np.float32)
+        # Pass 2C: Parallel Batched GPU Inference on all remaining utterances (3x-4x faster on RTX 3050+!)
+        if still_pending:
+            if batch_size <= 1:
+                for it in still_pending:
+                    _synth_single_item(it)
+            else:
+                # Separate rare items whose speaker lock was too short (<0.9s) from ready prompted items
+                prompted_batch_pool = []
+                for it in still_pending:
+                    p_obj = global_prompt if global_prompt is not None else speaker_prompts.get(it["spk_key"])
+                    if p_obj is None:
+                        _synth_single_item(it)
+                    else:
+                        it["prompt"] = p_obj
+                        # Refresh duration/speed estimate now that speaker prompt is locked
+                        s_ref = segs[it["idx"]]
+                        orig_start = float(s_ref["start"])
+                        orig_end = float(s_ref["end"])
+                        next_start = float(segs[it["idx"] + 1]["start"]) if (it["idx"] + 1 < n_segs) else total_duration
+                        base_avail = max(0.30, next_start - orig_start - min_gap)
+                        slot_budget = min(
+                            max(orig_end - orig_start, min(base_avail + 0.18, (orig_end - orig_start) + 0.65)),
+                            max(0.30, base_avail + 0.22),
+                        )
+                        est_dur = _estimate_duration_sec(model, it["txt"], p_obj)
+                        need = est_dur / max(0.28, slot_budget)
+                        it["gen_speed"] = float(np.clip(need * 1.02, 1.0, min(max_speedup, 1.38))) if need > 1.06 else 1.0
+                        speeds[it["idx"]] = need
+                        prompted_batch_pool.append(it)
 
-            audios.append(y_44k if y_44k is not None else np.zeros(0, np.float32))
+                for b_start in range(0, len(prompted_batch_pool), batch_size):
+                    if cancelled and cancelled():
+                        raise InterruptedError("Đã hủy")
+                    chunk = prompted_batch_pool[b_start:b_start + batch_size]
+                    if len(chunk) == 1:
+                        _synth_single_item(chunk[0])
+                        continue
+                    try:
+                        raw_list = model.generate(
+                            text=[x["txt"] for x in chunk],
+                            language=lang_code,
+                            voice_clone_prompt=[x["prompt"] for x in chunk],
+                            instruct=None,
+                            speed=[x["gen_speed"] for x in chunk],
+                            num_step=steps,
+                            denoise=True,
+                            postprocess_output=True,
+                        )
+                        for x, raw_item in zip(chunk, raw_list):
+                            raw_24k = np.asarray(raw_item, dtype=np.float32).reshape(-1)
+                            y_44k = _trim_silence(_resample_to_sr(raw_24k, sr_out, SR))
+                            if len(y_44k) > 0:
+                                save_wav(x["cache_p"], y_44k[None, :], SR)
+                            audios[x["idx"]] = y_44k
+                        _bump_prog(len(chunk))
+                    except InterruptedError:
+                        raise
+                    except RuntimeError as oom_e:
+                        # Graceful OOM / batch fallback -> synthesize this chunk 1-by-1 without failing!
+                        log(f"  ℹ Giảm cỡ batch tạm thời cho cụm câu dài ({oom_e.__class__.__name__})...")
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        for x in chunk:
+                            _synth_single_item(x)
+                    except Exception:
+                        for x in chunk:
+                            _synth_single_item(x)
 
-            if progress:
-                progress(0.10 + 0.85 * ((i + 1) / n_segs))
-
-        track, info = place_audios_on_track(segs, audios, speeds, total_duration, min_gap_ms=min_gap_ms)
+        final_audios = [a if a is not None else np.zeros(0, np.float32) for a in audios]
+        track, info = place_audios_on_track(segs, final_audios, speeds, total_duration, min_gap_ms=min_gap_ms)
         if progress:
             progress(1.0)
         return track, info

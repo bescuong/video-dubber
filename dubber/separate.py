@@ -79,10 +79,19 @@ def separate(audio, log=print, use_gpu=True, progress=None, cancelled=None):
     torch.hub.load_state_dict_from_url = _safe_load_state_dict
 
     from demucs.apply import apply_model
+    from .hw_profile import apply_torch_cuda_optimizations, configure_cpu_threads, get_hw_profile
+
+    prof = get_hw_profile()
+    if use_gpu and prof.driver_outdated and prof.driver_warning:
+        log(prof.driver_warning)
 
     model = _load_demucs_model()
     model.eval()
     device = "cuda" if use_gpu and torch.cuda.is_available() else "cpu"
+    if device == "cuda":
+        apply_torch_cuda_optimizations()
+    else:
+        configure_cpu_threads(prof)
     wav = torch.from_numpy(audio)
     total_len = max(1, wav.shape[-1])
     seg_samples = _get_segment_samples(model)

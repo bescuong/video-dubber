@@ -23,36 +23,67 @@ if sys.stderr is None:
 def _setup_windows_dlls():
     if sys.platform != "win32":
         return
+    py_dir = os.path.dirname(sys.executable)
+    exe_dir = os.path.dirname(os.path.abspath(sys.argv[0] if sys.argv else sys.executable))
+
     dirs = [
-        os.path.dirname(sys.executable),
-        os.path.join(os.path.dirname(sys.executable), "bin"),
+        py_dir,
+        os.path.join(py_dir, "bin"),
+        os.path.join(py_dir, "_internal"),
+        os.path.join(py_dir, "_internal", "bin"),
+        os.path.join(py_dir, "_internal", "torch", "lib"),
+        os.path.join(py_dir, "_internal", "ctranslate2"),
+        exe_dir,
+        os.path.join(exe_dir, "bin"),
+        os.path.join(exe_dir, "_internal", "torch", "lib"),
+        os.path.join(exe_dir, "_internal", "ctranslate2"),
     ]
     if hasattr(sys, "_MEIPASS"):
-        dirs.append(sys._MEIPASS)
-        dirs.append(os.path.join(sys._MEIPASS, "bin"))
+        dirs.extend([
+            sys._MEIPASS,
+            os.path.join(sys._MEIPASS, "bin"),
+            os.path.join(sys._MEIPASS, "torch", "lib"),
+            os.path.join(sys._MEIPASS, "ctranslate2"),
+        ])
 
-    # Also check local bin directory next to script/executable
-    exe_dir = os.path.dirname(os.path.abspath(sys.argv[0] if sys.argv else sys.executable))
-    dirs.append(exe_dir)
-    dirs.append(os.path.join(exe_dir, "bin"))
+    # Virtualenv / site-packages locations
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    venv_sp = os.path.join(repo_root, ".venv", "Lib", "site-packages")
+    dirs.extend([
+        os.path.join(repo_root, ".venv", "Scripts"),
+        os.path.join(venv_sp, "torch", "lib"),
+        os.path.join(venv_sp, "ctranslate2"),
+    ])
 
     if hasattr(site, "getsitepackages"):
         try:
             for sp in site.getsitepackages():
                 dirs.append(os.path.join(sp, "torch", "lib"))
+                dirs.append(os.path.join(sp, "ctranslate2"))
                 dirs.append(os.path.join(sp, "PySide6"))
                 dirs.append(os.path.join(sp, "shiboken6"))
         except Exception:
             pass
 
+    seen = set()
+    cur_path_parts = set(os.environ.get("PATH", "").split(os.pathsep))
+    prepend_parts = []
     for d in dirs:
-        if d and os.path.isdir(d):
-            try:
-                _DLL_HANDLES.append(os.add_dll_directory(d))
-            except (OSError, AttributeError):
-                pass
-            if d not in os.environ.get("PATH", "").split(os.pathsep):
-                os.environ["PATH"] = d + os.pathsep + os.environ.get("PATH", "")
+        if not d:
+            continue
+        nd = os.path.normcase(os.path.abspath(d))
+        if nd in seen or not os.path.isdir(d):
+            continue
+        seen.add(nd)
+        try:
+            _DLL_HANDLES.append(os.add_dll_directory(d))
+        except (OSError, AttributeError):
+            pass
+        if d not in cur_path_parts:
+            prepend_parts.append(d)
+
+    if prepend_parts:
+        os.environ["PATH"] = os.pathsep.join(prepend_parts) + os.pathsep + os.environ.get("PATH", "")
 
 
 _setup_windows_dlls()

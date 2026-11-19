@@ -1,4 +1,4 @@
-"""FFmpeg helpers."""
+"""FFmpeg helpers with optional GPU hardware-accelerated frame decoding (`cuda` / `d3d11va`)."""
 import json
 import subprocess
 import numpy as np
@@ -59,8 +59,8 @@ def save_wav(path, audio, sr=44100):
     sf.write(str(path), a, sr, subtype="FLOAT")
 
 
-def read_frames(path, fps, width, height, scale_width=None, sample_fps=None):
-    """Yield (index, frame BGR uint8) decoded by ffmpeg at constant frame rate."""
+def read_frames(path, fps, width, height, scale_width=None, sample_fps=None, hwaccel: str = ""):
+    """Yield `(index, frame BGR uint8)` decoded by ffmpeg with automatic GPU hwaccel fallback."""
     vf = []
     out_fps = sample_fps or fps
     vf.append(f"fps={out_fps}")
@@ -71,19 +71,46 @@ def read_frames(path, fps, width, height, scale_width=None, sample_fps=None):
         vf.append(f"scale={w}:{h}")
     else:
         vf.append(f"scale={w}:{h}")
-    cmd = ["ffmpeg", "-v", "error", "-i", str(path), "-an", "-vf", ",".join(vf),
-           "-f", "rawvideo", "-pix_fmt", "bgr24", "-"]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                            creationflags=CREATE_NO_WINDOW, bufsize=w * h * 3 * 4)
+
     size = w * h * 3
+
+    def _spawn(hw: str):
+        cmd = ["ffmpeg", "-v", "error"]
+        if hw:
+            cmd += ["-hwaccel", hw]
+        cmd += ["-i", str(path), "-an", "-vf", ",".join(vf), "-f", "rawvideo", "-pix_fmt", "bgr24", "-"]
+        return subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            creationflags=CREATE_NO_WINDOW, bufsize=size * 4,
+        )
+
+    proc = _spawn(hwaccel)
     i = 0
     try:
-        while True:
-            buf = proc.stdout.read(size)
-            if len(buf) < size:
-                break
-            yield i, np.frombuffer(buf, np.uint8).reshape(h, w, 3)
-            i += 1
+        first_buf = proc.stdout.read(size)
+        if len(first_buf) < size and hwaccel:
+            # Codec/driver unsupported by hwaccel -> transparently fall back to software decode
+            try:
+                proc.stdout.close()
+                proc.wait(timeout=2)
+            except Exception:
+                proc.kill()
+            proc = _spawn("")
+            first_buf = proc.stdout.read(size)
+
+        if len(first_buf) == size:
+            yield 0, np.frombuffer(first_buf, np.uint8).reshape(h, w, 3)
+            i = 1
+            while True:
+                buf = proc.stdout.read(size)
+                if len(buf) < size:
+                    break
+                yield i, np.frombuffer(buf, np.uint8).reshape(h, w, 3)
+                i += 1
     finally:
-        proc.stdout.close()
+        try:
+            if proc.stdout:
+                proc.stdout.close()
+        except Exception:
+            pass
         proc.wait()

@@ -30,7 +30,7 @@ if sys.stdout is None:
 if sys.stderr is None:
     sys.stderr = _SafeStream()
 
-EMBEDDED_APP_VERSION = "2.3.0"
+EMBEDDED_APP_VERSION = "2.4.0"
 
 
 def _boot_hotpatch_if_newer():
@@ -78,7 +78,7 @@ def _boot_hotpatch_if_newer():
 _boot_hotpatch_if_newer()
 
 import dubber  # noqa: F401 - initializes Windows DLL directories first
-from dubber import auth, gemini_translate, media, omnivoice_tts, pipeline, updater
+from dubber import auth, gemini_translate, hw_profile, media, omnivoice_tts, pipeline, updater
 from dubber.config import (
     LANGUAGES,
     NLLB_MODELS,
@@ -126,7 +126,7 @@ from PySide6.QtWidgets import (
 )
 
 VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".flv", ".m4v", ".ts"}
-APP_VERSION = "2.3.0"
+APP_VERSION = "2.4.0"
 
 
 def _app_icon() -> QIcon:
@@ -1103,6 +1103,10 @@ class MainWindow(QMainWindow):
         self._sync_tts_engine_ui()
         self._sync_process_mode_ui()
         self._refresh_gemini_badge()
+        prof_init = hw_profile.get_hw_profile()
+        self._log(f"🖥 Cấu hình tăng tốc: {prof_init.badge_text}")
+        if prof_init.driver_outdated and prof_init.driver_warning:
+            self._log(prof_init.driver_warning)
 
         # Live Firebase account heartbeat (every 2.5 minutes) — kicks immediately if disabled on Firebase
         self._auth_timer = QTimer(self)
@@ -1173,11 +1177,35 @@ class MainWindow(QMainWindow):
 
         main_layout.addWidget(header)
 
+        # ── 1B. Proactive NVIDIA Driver Outdated Alert Banner (if CUDA failed on an NVIDIA PC) ──
+        prof = hw_profile.get_hw_profile()
+        if prof.driver_outdated and prof.driver_warning:
+            drv_bar = QFrame()
+            drv_bar.setStyleSheet(
+                "QFrame { background-color: #fff7ed; border: 1.5px solid #fb923c; border-radius: 7px; }"
+            )
+            d_lay = QHBoxLayout(drv_bar)
+            d_lay.setContentsMargins(12, 6, 12, 6)
+            d_lay.setSpacing(10)
+            lbl_drv = QLabel(prof.driver_warning)
+            lbl_drv.setWordWrap(True)
+            lbl_drv.setStyleSheet("color: #9a3412; font-weight: bold; font-size: 12px; border: none;")
+            btn_dl_drv = QPushButton("🌐 Tải NVIDIA Driver mới nhất")
+            btn_dl_drv.setCursor(Qt.PointingHandCursor)
+            btn_dl_drv.setStyleSheet(
+                "QPushButton { background: #ea580c; color: white; font-weight: bold; padding: 6px 12px; border-radius: 5px; border: none; }"
+                "QPushButton:hover { background: #c2410c; }"
+            )
+            btn_dl_drv.clicked.connect(self._open_nvidia_driver_page)
+            d_lay.addWidget(lbl_drv, 1)
+            d_lay.addWidget(btn_dl_drv)
+            main_layout.addWidget(drv_bar)
+
         # ── Status Bar & Menu Bar ───────────────────────────────────────
         self._status_bar = QStatusBar()
         self.setStatusBar(self._status_bar)
         self._status_bar.showMessage(
-            f"Thiết bị kích hoạt: {auth.get_short_machine_id()}  ·  Sẵn sàng xử lý video"
+            f"{prof.badge_text}  ·  Thiết bị: {auth.get_short_machine_id()}"
         )
         self._build_menu()
 
@@ -1651,7 +1679,7 @@ class MainWindow(QMainWindow):
         self.sp_ocr_fps = QDoubleSpinBox()
         self.sp_ocr_fps.setRange(2.0, 10.0)
         self.sp_ocr_fps.setSingleStep(1.0)
-        self.sp_ocr_fps.setValue(5.0)
+        self.sp_ocr_fps.setValue(4.0)
 
         reg_row.addWidget(QLabel("X:"))
         reg_row.addWidget(self.sp_reg_left)
@@ -2065,6 +2093,11 @@ class MainWindow(QMainWindow):
         )
         if ret == QMessageBox.Yes:
             self._force_kick_to_login("Đã đăng xuất tài khoản thành công.")
+
+    @staticmethod
+    def _open_nvidia_driver_page():
+        import webbrowser
+        webbrowser.open("https://www.nvidia.com/Download/index.aspx")
 
     def _copy_machine_id(self):
         mid = auth.get_short_machine_id()

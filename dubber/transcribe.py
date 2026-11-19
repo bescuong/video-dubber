@@ -121,27 +121,40 @@ def transcribe(wav16k_path, model_name="medium", language=None, use_gpu=True, lo
                progress=None, duration=None):
     _add_cuda_dlls()
     from faster_whisper import WhisperModel
+    from .hw_profile import get_hw_profile
 
+    prof = get_hw_profile()
     if language and "-" in language:
         language = language.split("-")[0]
 
     model = None
     if use_gpu:
-        try:
-            model = WhisperModel(model_name, device="cuda", compute_type="int8")
-            log(f"Whisper '{model_name}' chạy trên GPU (int8)")
-        except Exception as e:
-            log(f"Không chạy được Whisper trên GPU ({e}); chuyển sang CPU")
+        if prof.driver_outdated and prof.driver_warning:
+            log(prof.driver_warning)
+        else:
+            # Try optimal compute_type for this GPU tier first (e.g. int8_float16 on RTX 3050), fallback to int8
+            tried = []
+            for ctype in (prof.whisper_compute, "int8"):
+                if ctype in tried:
+                    continue
+                tried.append(ctype)
+                try:
+                    model = WhisperModel(model_name, device="cuda", compute_type=ctype)
+                    log(f"Whisper '{model_name}' chạy trên GPU CUDA ({prof.gpu_name}, {ctype})")
+                    break
+                except Exception as e:
+                    if ctype == "int8":
+                        log(f"Không chạy được Whisper trên GPU ({e}); chuyển sang CPU")
     if model is None:
         model = WhisperModel(model_name, device="cpu", compute_type="int8",
-                             cpu_threads=max(4, (os.cpu_count() or 4) - 2))
-        log(f"Whisper '{model_name}' chạy trên CPU (int8)")
+                             cpu_threads=prof.cpu_threads)
+        log(f"Whisper '{model_name}' chạy trên CPU ({prof.cpu_threads} luồng, int8)")
 
     segments_iter, info = model.transcribe(
         str(wav16k_path),
         language=language,
         vad_filter=True,
-        beam_size=5,
+        beam_size=prof.whisper_beam,
         word_timestamps=True,
         condition_on_previous_text=False,
         vad_parameters={"min_silence_duration_ms": 350, "speech_pad_ms": 180},

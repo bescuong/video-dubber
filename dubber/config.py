@@ -235,7 +235,7 @@ class Settings:
     sub_region_right: float = 0.98       # horizontal right edge of movable ROI (0..1)
     sub_region_top: float = 0.72         # vertical top edge of movable ROI (0..1)
     sub_region_bottom: float = 0.98      # vertical bottom edge of movable ROI (0..1)
-    ocr_fps: float = 5.0                 # frames per second sampled for OCR
+    ocr_fps: float = 4.0                 # frames per second sampled for OCR (4fps = 0.25s + Smart Frame-Skip)
     blur_style: str = "inpaint_blur"     # inpaint_blur | box | blur | pixelate
     sub_font_size: int = 0               # 0 = auto consistent size
     sub_place_on_old: bool = True        # align unified subtitle Y-band with old subs

@@ -40,7 +40,7 @@ if defined ISCC_PATH (
         echo ====================================================
         echo   HOÀN TẤT!
         echo   1. Thư mục chạy trực tiếp: dist\VideoDubber\VideoDubber.exe
-        echo   2. File cài đặt Setup:     Output\VideoDubber_v2.3.0_Setup.exe
+        echo   2. File cài đặt Setup:     Output\VideoDubber_v2.4.0_Setup.exe
         echo ====================================================
     )
 ) else (

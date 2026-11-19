@@ -1,42 +1,58 @@
-"""Offline machine translation with Meta NLLB-200."""
+"""Offline machine translation with Meta NLLB-200 (FP16 Tensor Core accelerated on CUDA)."""
 import gc
 import warnings
 
 
 def translate(texts, src_nllb, tgt_nllb, model_name, use_gpu=True, log=print, progress=None,
-              batch_size=8):
+              batch_size=None):
     import torch
     from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+    from .hw_profile import apply_torch_cuda_optimizations, configure_cpu_threads, get_hw_profile
 
     if not texts:
         return []
 
-    tok = AutoTokenizer.from_pretrained(model_name, src_lang=src_nllb)
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        model = AutoModelForSeq2SeqLM.from_pretrained(model_name, dtype=torch.float32)
-    model.eval()
+    prof = get_hw_profile()
+    want_cuda = bool(use_gpu and torch.cuda.is_available())
+    if batch_size is None:
+        batch_size = prof.nllb_batch_size if want_cuda else 6
 
+    tok = AutoTokenizer.from_pretrained(model_name, src_lang=src_nllb)
     device = "cpu"
-    if use_gpu and torch.cuda.is_available():
+    model = None
+
+    if want_cuda:
         try:
+            apply_torch_cuda_optimizations()
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                model = AutoModelForSeq2SeqLM.from_pretrained(model_name, dtype=torch.float16)
+            model.eval()
             model.to("cuda")
             device = "cuda"
         except RuntimeError:
-            model.to("cpu")
+            model = None
             torch.cuda.empty_cache()
-    if device == "cpu":
-        torch.set_num_threads(max(4, torch.get_num_threads()))
-    log(f"Dịch bằng {model_name.split('/')[-1]} trên {device.upper()}")
+
+    if model is None:
+        configure_cpu_threads(prof)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            model = AutoModelForSeq2SeqLM.from_pretrained(model_name, dtype=torch.float32)
+        model.eval()
+        device = "cpu"
+
+    dtype_tag = "fp16" if device == "cuda" else "fp32"
+    log(f"Dịch bằng {model_name.split('/')[-1]} trên {device.upper()} ({dtype_tag}, batch={batch_size})")
 
     bos = tok.convert_tokens_to_ids(tgt_nllb)
 
     def _gen(batch, dev):
         enc = tok(batch, return_tensors="pt", padding=True, truncation=True,
                   max_length=400).to(dev)
-        max_new = int(enc["input_ids"].shape[1] * 2.5) + 20
-        with torch.no_grad():
-            out = model.generate(**enc, forced_bos_token_id=bos, num_beams=4,
+        max_new = int(enc["input_ids"].shape[1] * 2.4) + 18
+        with torch.inference_mode():
+            out = model.generate(**enc, forced_bos_token_id=bos, num_beams=2,
                                  max_new_tokens=max_new)
         return tok.batch_decode(out, skip_special_tokens=True)
 
@@ -48,7 +64,7 @@ def translate(texts, src_nllb, tgt_nllb, model_name, use_gpu=True, log=print, pr
         except RuntimeError as e:
             if device == "cuda" and "out of memory" in str(e).lower():
                 log("GPU hết bộ nhớ khi dịch, chuyển sang CPU")
-                model.to("cpu")
+                model.float().to("cpu")
                 torch.cuda.empty_cache()
                 device = "cpu"
                 results.extend(_gen(batch, device))
