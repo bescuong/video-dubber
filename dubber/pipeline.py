@@ -274,24 +274,53 @@ def render(video, settings: Settings, segments, cb: Callbacks = None, output=Non
     tgt = LANGUAGES.get(settings.target_lang, LANGUAGES["vi"])
     save_project(video, settings, segments, (load_project(video) or {}).get("source_lang", "auto"))
 
-    # 1. TTS with Character Voices & Anti-Slur Elastic Timeline
+    # 1. TTS with OmniVoice AI (Zero-Shot Clone / Voice Design) or Edge Neural TTS + Elastic Timeline
     p = cb.stage(STAGE_TTS)
     from .gender import resolve_voice_for_segment
+    from . import omnivoice_tts
     from .tts import synthesize_track
 
     for s in segments:
         s["voice"] = resolve_voice_for_segment(s, settings)
 
-    dub, tinfo = synthesize_track(
-        segments,
-        info["duration"],
-        str(wd / "tts"),
-        max_speedup=settings.max_speedup,
-        min_gap_ms=getattr(settings, "min_gap_ms", 150),
-        log=cb.log,
-        progress=p,
-        cancelled=cb.cancelled,
-    )
+    want_omni = getattr(settings, "tts_engine", "omnivoice") == "omnivoice"
+    if want_omni and not omnivoice_tts.is_omnivoice_available():
+        cb.log(
+            "⚠ Phiên bản cài đặt hiện tại chưa tích hợp gói thư viện OmniVoice AI — "
+            "tự động chuyển sang Edge Neural TTS (vui lòng chạy file Setup v2.2.0 để dùng OmniVoice)."
+        )
+        want_omni = False
+
+    if want_omni:
+        vocals_p = wd / "vocals.wav"
+        ref_src = vocals_p if vocals_p.exists() else video
+        dub, tinfo = omnivoice_tts.synthesize_track_omnivoice(
+            segments,
+            info["duration"],
+            str(wd / "tts_omni"),
+            target_lang=settings.target_lang,
+            vocals_path=ref_src,
+            preset=getattr(settings, "omnivoice_preset", "clone_auto"),
+            ref_audio_path=getattr(settings, "omnivoice_ref_audio", ""),
+            use_gpu=settings.use_gpu,
+            max_speedup=settings.max_speedup,
+            min_gap_ms=getattr(settings, "min_gap_ms", 150),
+            num_step=int(getattr(settings, "omnivoice_steps", 16)),
+            log=cb.log,
+            progress=p,
+            cancelled=cb.cancelled,
+        )
+    else:
+        dub, tinfo = synthesize_track(
+            segments,
+            info["duration"],
+            str(wd / "tts"),
+            max_speedup=settings.max_speedup,
+            min_gap_ms=getattr(settings, "min_gap_ms", 150),
+            log=cb.log,
+            progress=p,
+            cancelled=cb.cancelled,
+        )
     fast = sum(1 for t in tinfo if t["speed"] > settings.max_speedup * 1.05)
     if fast:
         cb.log(f"ℹ Có {fast} câu thoại dịch khá dài đã được tự động cân chỉnh giãn nhịp.")

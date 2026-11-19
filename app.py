@@ -30,7 +30,7 @@ if sys.stdout is None:
 if sys.stderr is None:
     sys.stderr = _SafeStream()
 
-EMBEDDED_APP_VERSION = "2.1.0"
+EMBEDDED_APP_VERSION = "2.2.0"
 
 
 def _boot_hotpatch_if_newer():
@@ -78,7 +78,7 @@ def _boot_hotpatch_if_newer():
 _boot_hotpatch_if_newer()
 
 import dubber  # noqa: F401 - initializes Windows DLL directories first
-from dubber import auth, gemini_translate, media, pipeline, updater
+from dubber import auth, gemini_translate, media, omnivoice_tts, pipeline, updater
 from dubber.config import (
     LANGUAGES,
     NLLB_MODELS,
@@ -126,7 +126,7 @@ from PySide6.QtWidgets import (
 )
 
 VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".flv", ".m4v", ".ts"}
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.2.0"
 
 
 def _app_icon() -> QIcon:
@@ -161,19 +161,44 @@ class SessionVerifyWorker(QThread):
 
 
 class VoicePreviewWorker(QThread):
-    """Synthesizes and plays a short voice sample via Windows native audio."""
+    """Synthesizes and plays a short voice sample via Windows native audio (OmniVoice or Edge TTS)."""
     done_sig = Signal(bool, str)
 
-    def __init__(self, voice_spec: str, text: str):
+    def __init__(
+        self,
+        engine: str,
+        voice_or_preset: str,
+        text: str,
+        target_lang: str = "vi",
+        ref_audio_path: str = "",
+        use_gpu: bool = True,
+        omni_steps: int = 16,
+    ):
         super().__init__()
-        self.voice_spec = voice_spec
+        self.engine = engine
+        self.voice_or_preset = voice_or_preset
         self.text = text
+        self.target_lang = target_lang
+        self.ref_audio_path = ref_audio_path
+        self.use_gpu = use_gpu
+        self.omni_steps = omni_steps
 
     def run(self):
         try:
-            from dubber.tts import synthesize_preview_wav
             out_wav = os.path.join(tempfile.gettempdir(), "videodubber_voice_preview.wav")
-            synthesize_preview_wav(self.voice_spec, self.text, out_wav)
+            if self.engine == "omnivoice":
+                omnivoice_tts.synthesize_preview_wav_omnivoice(
+                    preset=self.voice_or_preset,
+                    target_lang=self.target_lang,
+                    text=self.text,
+                    out_wav=out_wav,
+                    ref_audio_path=self.ref_audio_path,
+                    use_gpu=self.use_gpu,
+                    num_step=self.omni_steps,
+                )
+            else:
+                from dubber.tts import synthesize_preview_wav
+                synthesize_preview_wav(self.voice_or_preset, self.text, out_wav)
             if sys.platform == "win32":
                 import winsound
                 winsound.PlaySound(out_wav, winsound.SND_FILENAME | winsound.SND_ASYNC)
@@ -787,6 +812,7 @@ class MainWindow(QMainWindow):
         self._apply_theme()
         self._setup_tray()
         self._refresh_voice_combo()
+        self._sync_tts_engine_ui()
         self._refresh_gemini_badge()
 
         # Live Firebase account heartbeat (every 2.5 minutes) — kicks immediately if disabled on Firebase
@@ -1136,7 +1162,63 @@ class MainWindow(QMainWindow):
         style_row.addWidget(self.ed_trans_notes, 2)
         lay.addLayout(style_row)
 
-        # Row 2: Character / Voice Mode
+        # Row 2: TTS Engine Selector (OmniVoice AI vs Edge Neural TTS)
+        tts_eng_row = QHBoxLayout()
+        self.cb_tts_engine = QComboBox()
+        self.cb_tts_engine.addItem("🔥 OmniVoice AI — Clone giọng gốc nhân vật & Thiết kế giọng (Đề xuất)", "omnivoice")
+        self.cb_tts_engine.addItem("☁️ Edge Neural TTS — 75 giọng Online siêu nhanh", "edge")
+        if not omnivoice_tts.is_omnivoice_available():
+            self.cb_tts_engine.setCurrentIndex(1)
+        self.cb_tts_engine.currentIndexChanged.connect(self._sync_tts_engine_ui)
+        tts_eng_row.addWidget(QLabel("Thư viện giọng:"))
+        tts_eng_row.addWidget(self.cb_tts_engine, 1)
+        lay.addLayout(tts_eng_row)
+
+        # Row 3A: OmniVoice Controls (Visible when OmniVoice AI is active)
+        self.w_omni_box = QWidget()
+        omni_v = QVBoxLayout(self.w_omni_box)
+        omni_v.setContentsMargins(0, 0, 0, 0)
+        omni_v.setSpacing(6)
+
+        omni_p_row = QHBoxLayout()
+        self.cb_omni_preset = QComboBox()
+        for pid, plabel, _inst, _gen in omnivoice_tts.OMNIVOICE_PRESETS:
+            self.cb_omni_preset.addItem(plabel, pid)
+        self.cb_omni_preset.currentIndexChanged.connect(self._sync_tts_engine_ui)
+
+        self.btn_preview_omni = QPushButton("🔊 Nghe thử giọng")
+        self.btn_preview_omni.setCursor(Qt.PointingHandCursor)
+        self.btn_preview_omni.setStyleSheet(
+            "QPushButton { background: #eff6ff; color: #1d4ed8; font-weight: bold; border: 1px solid #bfdbfe; padding: 5px 12px; }"
+            "QPushButton:hover { background: #dbeafe; }"
+        )
+        self.btn_preview_omni.clicked.connect(self._play_voice_preview)
+
+        omni_p_row.addWidget(QLabel("Kiểu giọng AI:"))
+        omni_p_row.addWidget(self.cb_omni_preset, 1)
+        omni_p_row.addWidget(self.btn_preview_omni)
+        omni_v.addLayout(omni_p_row)
+
+        self.w_omni_ref_row = QWidget()
+        ref_h = QHBoxLayout(self.w_omni_ref_row)
+        ref_h.setContentsMargins(0, 0, 0, 0)
+        ref_h.setSpacing(6)
+        self.ed_omni_ref = QLineEdit()
+        self.ed_omni_ref.setPlaceholderText("Chọn file giọng mẫu rõ ràng dài 3–10 giây (.wav, .mp3, .m4a)...")
+        btn_pick_ref = QPushButton("📂 Chọn file giọng mẫu...")
+        btn_pick_ref.clicked.connect(self._browse_omni_ref)
+        ref_h.addWidget(QLabel("File giọng mẫu:"))
+        ref_h.addWidget(self.ed_omni_ref, 1)
+        ref_h.addWidget(btn_pick_ref)
+        omni_v.addWidget(self.w_omni_ref_row)
+        lay.addWidget(self.w_omni_box)
+
+        # Row 3B: Edge Neural TTS Controls (Visible when Edge TTS is active)
+        self.w_edge_box = QWidget()
+        edge_v = QVBoxLayout(self.w_edge_box)
+        edge_v.setContentsMargins(0, 0, 0, 0)
+        edge_v.setSpacing(6)
+
         mode_row = QHBoxLayout()
         self.cb_voice_mode = QComboBox()
         self.cb_voice_mode.addItem("🎭 Tự động phân vai Nhân vật + Nam/Nữ/Trẻ em (Khuyên dùng)", "auto_character")
@@ -1146,9 +1228,8 @@ class MainWindow(QMainWindow):
         self.cb_voice_mode.addItem("👩 Luôn dùng giọng Nữ chính", "female")
         mode_row.addWidget(QLabel("Chế độ phân vai:"))
         mode_row.addWidget(self.cb_voice_mode, 1)
-        lay.addLayout(mode_row)
+        edge_v.addLayout(mode_row)
 
-        # Row 3: Rich Country Voice Picker + Live Preview Button
         voice_row = QHBoxLayout()
         self.cb_voice_pick = QComboBox()
         self.btn_preview_voice = QPushButton("🔊 Nghe thử giọng")
@@ -1162,7 +1243,8 @@ class MainWindow(QMainWindow):
         voice_row.addWidget(QLabel("Giọng đọc mẫu:"))
         voice_row.addWidget(self.cb_voice_pick, 1)
         voice_row.addWidget(self.btn_preview_voice)
-        lay.addLayout(voice_row)
+        edge_v.addLayout(voice_row)
+        lay.addWidget(self.w_edge_box)
 
         # Row 4: Clean Toggle Checkboxes
         self.chk_demucs = QCheckBox("🎵 Giữ nguyên nhạc nền & tiếng động gốc (Tách giọng AI Demucs)")
@@ -1293,6 +1375,12 @@ class MainWindow(QMainWindow):
             self.cb_whisper.addItem(m, m)
         self.cb_whisper.setCurrentText("medium")
 
+        self.cb_omni_steps = QComboBox()
+        self.cb_omni_steps.addItem("16 bước (Nhanh & rõ - Khuyên dùng)", 16)
+        self.cb_omni_steps.addItem("24 bước (Chất lượng cao)", 24)
+        self.cb_omni_steps.addItem("32 bước (Studio tối đa)", 32)
+        self.cb_omni_steps.setToolTip("Số bước khuếch tán của OmniVoice AI (16 bước đã rất tự nhiên và nhanh)")
+
         self.cb_nllb = QComboBox()
         for label, model_id in NLLB_MODELS.items():
             self.cb_nllb.addItem(label, model_id)
@@ -1302,6 +1390,8 @@ class MainWindow(QMainWindow):
 
         mdl_row.addWidget(QLabel("Whisper:"))
         mdl_row.addWidget(self.cb_whisper)
+        mdl_row.addWidget(QLabel("OmniVoice:"))
+        mdl_row.addWidget(self.cb_omni_steps)
         mdl_row.addWidget(QLabel("NLLB:"))
         mdl_row.addWidget(self.cb_nllb, 1)
         mdl_row.addWidget(self.chk_gpu)
@@ -1484,24 +1574,74 @@ class MainWindow(QMainWindow):
             icon = "👩" if v.gender == "female" else ("🧒" if v.gender == "child" else "👨")
             self.cb_voice_pick.addItem(f"{icon} {v.name}", encode_voice_spec(v))
 
-    def _play_voice_preview(self):
-        voice_spec = self.cb_voice_pick.currentData()
-        lang_code = self.cb_tgt.currentData() or "vi"
-        if not voice_spec:
-            return
-        sample_txt = SAMPLE_PREVIEW_TEXT.get(lang_code, SAMPLE_PREVIEW_TEXT["en"])
-        self.btn_preview_voice.setEnabled(False)
-        self.btn_preview_voice.setText("⏳ Đang tạo mẫu...")
+    def _sync_tts_engine_ui(self):
+        eng = self.cb_tts_engine.currentData() or "omnivoice"
+        is_omni = eng == "omnivoice"
+        self.w_omni_box.setVisible(is_omni)
+        self.w_edge_box.setVisible(not is_omni)
+        if is_omni:
+            preset = self.cb_omni_preset.currentData() or "clone_auto"
+            self.w_omni_ref_row.setVisible(preset == "clone_file")
 
-        self._preview_worker = VoicePreviewWorker(voice_spec, sample_txt)
+    def _browse_omni_ref(self):
+        p, _ = QFileDialog.getOpenFileName(
+            self,
+            "Chọn file giọng nói mẫu (3–10 giây rõ lời)",
+            "",
+            "Âm thanh / Video (*.wav *.mp3 *.m4a *.ogg *.flac *.mp4);;Tất cả (*.*)",
+        )
+        if p:
+            self.ed_omni_ref.setText(p)
+
+    def _play_voice_preview(self):
+        eng = self.cb_tts_engine.currentData() or "omnivoice"
+        lang_code = self.cb_tgt.currentData() or "vi"
+        sample_txt = SAMPLE_PREVIEW_TEXT.get(lang_code, SAMPLE_PREVIEW_TEXT["en"])
+
+        if eng == "omnivoice":
+            preset = self.cb_omni_preset.currentData() or "clone_auto"
+            ref_path = self.ed_omni_ref.text().strip()
+            if preset == "clone_file" and (not ref_path or not os.path.isfile(ref_path)):
+                QMessageBox.information(
+                    self,
+                    "Chưa chọn file giọng mẫu",
+                    "Vui lòng bấm '📂 Chọn file giọng mẫu...' trước khi nghe thử chế độ Clone từ file.",
+                )
+                return
+            self.btn_preview_omni.setEnabled(False)
+            self.btn_preview_omni.setText("⏳ Đang tạo mẫu AI...")
+            self._preview_worker = VoicePreviewWorker(
+                engine="omnivoice",
+                voice_or_preset=preset,
+                text=sample_txt,
+                target_lang=lang_code,
+                ref_audio_path=ref_path,
+                use_gpu=self.chk_gpu.isChecked(),
+                omni_steps=int(self.cb_omni_steps.currentData() or 16),
+            )
+        else:
+            voice_spec = self.cb_voice_pick.currentData()
+            if not voice_spec:
+                return
+            self.btn_preview_voice.setEnabled(False)
+            self.btn_preview_voice.setText("⏳ Đang tạo mẫu...")
+            self._preview_worker = VoicePreviewWorker(
+                engine="edge",
+                voice_or_preset=voice_spec,
+                text=sample_txt,
+                target_lang=lang_code,
+            )
+
         self._preview_worker.done_sig.connect(self._on_voice_preview_done)
         self._preview_worker.start()
 
     def _on_voice_preview_done(self, ok: bool, err: str):
         self.btn_preview_voice.setEnabled(True)
         self.btn_preview_voice.setText("🔊 Nghe thử giọng")
+        self.btn_preview_omni.setEnabled(True)
+        self.btn_preview_omni.setText("🔊 Nghe thử giọng")
         if not ok:
-            QMessageBox.warning(self, "Lỗi nghe thử giọng", f"Không phát được giọng mẫu (cần kết nối mạng):\n{err}")
+            QMessageBox.warning(self, "Lỗi nghe thử giọng", f"Không tạo được giọng mẫu:\n{err}")
 
     # ------------------------------------------------------------------ Account Security & Auto-Updater
     def _run_heartbeat_check(self):
@@ -1619,8 +1759,7 @@ class MainWindow(QMainWindow):
                 QMessageBox.information(
                     self,
                     "Chưa cấu hình kho cập nhật",
-                    "Chưa thiết lập kho GitHub nhận bản cập nhật.\n"
-                    "Quản trị viên có thể bấm nút '🚀 GitHub (Admin)' trên thanh tiêu đề để cấu hình repo.",
+                    "Chưa thiết lập kho GitHub nhận bản cập nhật.",
                 )
             return
 
@@ -1907,6 +2046,10 @@ class MainWindow(QMainWindow):
             dub_volume=float(self.sp_dub_vol.value()),
             max_speedup=float(self.sp_speed.value()),
             min_gap_ms=int(self.sp_gap_ms.value()),
+            tts_engine=self.cb_tts_engine.currentData() or "omnivoice",
+            omnivoice_preset=self.cb_omni_preset.currentData() or "clone_auto",
+            omnivoice_ref_audio=self.ed_omni_ref.text().strip(),
+            omnivoice_steps=int(self.cb_omni_steps.currentData() or 16),
             voice_mode=self.cb_voice_mode.currentData(),
             custom_voice=self.cb_voice_pick.currentData() or "",
             blur_old_subs=self.chk_blur.isChecked(),
@@ -1919,6 +2062,18 @@ class MainWindow(QMainWindow):
             sub_place_on_old=self.chk_place_old.isChecked(),
             sub_bg_box=self.chk_sub_bg.isChecked(),
         )
+
+    def _validate_tts_settings(self, settings: Settings) -> bool:
+        if settings.tts_engine == "omnivoice" and settings.omnivoice_preset == "clone_file":
+            if not settings.omnivoice_ref_audio or not os.path.isfile(settings.omnivoice_ref_audio):
+                QMessageBox.warning(
+                    self,
+                    "Chưa chọn file giọng mẫu",
+                    "Bạn đang chọn chế độ OmniVoice 'Clone từ file giọng mẫu' nhưng chưa chọn file hợp lệ.\n"
+                    "Vui lòng chọn file .wav / .mp3 (3–10 giây) hoặc đổi sang 'Tự động Clone giọng gốc nhân vật'.",
+                )
+                return False
+        return True
 
     def _set_running_ui(self, running: bool):
         self.btn_analyze.setEnabled(not running)
@@ -1943,6 +2098,8 @@ class MainWindow(QMainWindow):
 
         settings = self._collect_settings()
         if not self._ensure_gemini_key_if_needed(settings, will_translate=(mode in ("analyze", "both"))):
+            return
+        if mode in ("render", "both") and not self._validate_tts_settings(settings):
             return
         out_path = self.ed_output.text().strip() or None
         self._set_running_ui(True)
@@ -2100,6 +2257,8 @@ class MainWindow(QMainWindow):
         settings = self._collect_settings()
         if not self._ensure_gemini_key_if_needed(settings, will_translate=True):
             return
+        if not self._validate_tts_settings(settings):
+            return
         out_dir = self.ed_batch_out.text().strip()
 
         self.btn_batch_start.setEnabled(False)
@@ -2191,11 +2350,11 @@ class MainWindow(QMainWindow):
             self,
             f"Về Video Dubber Studio v{APP_VERSION}",
             f"<h3>🎬 Video Dubber Studio v{APP_VERSION}</h3>"
-            "<p>Giải pháp dịch thuật, phân vai lồng tiếng AI và thay thế phụ đề video chuyên nghiệp trên Windows.</p>"
+            "<p>Giải pháp dịch thuật chuẩn văn phong, Clone giọng nhân vật bằng OmniVoice AI và thay thế phụ đề video chuyên nghiệp trên Windows.</p>"
             "<ul>"
             "<li><b>Nhận diện & Tách câu thông minh:</b> Faster-Whisper (CUDA) chống cắt ngang ý</li>"
-            "<li><b>Dịch thuật ngoại tuyến:</b> Meta NLLB-200</li>"
-            "<li><b>Phân vai Nhân vật & Kho giọng đa quốc gia:</b> Việt, Mỹ, Anh, Hàn, Nhật, Trung...</li>"
+            "<li><b>Dịch kịch bản chuẩn văn phong:</b> Google Gemini AI (tự xoay vòng 8 Model Cao ➜ Thấp) & dự phòng NLLB-200 Offline</li>"
+            "<li><b>Giọng đọc siêu thực OmniVoice AI:</b> Tự động Clone giọng gốc từng nhân vật, Clone từ file mẫu & Thiết kế giọng đa ngôn ngữ + Edge Neural TTS dự phòng</li>"
             "<li><b>Chống dính chữ:</b> Cân bằng nhịp Elastic Timeline + Khoảng nghỉ tự nhiên</li>"
             "<li><b>Xóa sạch phụ đề cũ:</b> RapidOCR + Telea Stroke Inpainting & Cố định vị trí sub mới</li>"
             "<li><b>Bảo mật & Tự cập nhật:</b> Khóa thiết bị Firebase thời gian thực + GitHub Auto-Update</li>"

@@ -221,8 +221,12 @@ class Settings:
     dub_volume: float = 1.05
     max_speedup: float = 1.50            # max TTS speed-up (lowered from 1.6 to avoid slurring)
     min_gap_ms: int = 150                # minimum breath pause (ms) between sentences
-    voice_mode: str = "auto_character"   # auto_character | auto | male | female | custom
-    custom_voice: str = ""               # encoded voice spec when voice_mode == "custom"
+    tts_engine: str = "omnivoice"        # "omnivoice" (AI Voice Clone / Design) | "edge" (Microsoft Edge Neural)
+    omnivoice_preset: str = "clone_auto" # key of omnivoice_tts.OMNIVOICE_PRESETS
+    omnivoice_ref_audio: str = ""        # custom .wav/.mp3 path when omnivoice_preset == "clone_file"
+    omnivoice_steps: int = 16            # OmniVoice diffusion steps: 16 (fast crisp) | 24 (high) | 32 (ultra)
+    voice_mode: str = "auto_character"   # auto_character | auto | male | female | custom (Edge TTS)
+    custom_voice: str = ""               # encoded voice spec when voice_mode == "custom" (Edge TTS)
     # subtitles
     blur_old_subs: bool = True
     burn_new_subs: bool = True

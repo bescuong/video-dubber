@@ -1,6 +1,6 @@
 {
-  "version": "2.1.0",
+  "version": "2.2.0",
   "repo": "bescuong/video-dubber",
-  "notes": "Nâng cấp lớn v2.1.0 — Dịch Kịch Bản Chuẩn Văn Phong bằng Google Gemini AI:\n- Tích hợp 8 Model Gemini có lượt sử dụng tự động xoay vòng từ Cao ➜ Thấp (Gemini 4 Hydrogen ➔ 3.8 Flash ➔ 3.6 Flash ➔ 3 Flash ➔ 3.5 Flash Lite ➔ 3.1 Flash Lite ➔ 2.5 Flash ➔ 2.5 Flash Lite).\n- Tự động chuyển sang model kế tiếp ngay khi model trước hết lượt (429) hoặc gặp lỗi.\n- Bổ sung 8 chế độ Văn phong lồng tiếng (Phim truyện, Review phim, Hài hước/TikTok, Cổ trang/Tiên hiệp, Anime, Khoa học/Tin tức...) + Khóa chặt xưng hô theo vai nhân vật & khớp độ dài câu nói.\n- Nhập & lưu khóa Gemini API riêng biệt theo từng tài khoản (tự đồng bộ lên Firebase theo tài khoản).",
-  "hotpatch_url": "https://github.com/bescuong/video-dubber/releases/download/v2.1.0/VideoDubber_HotPatch_v2.1.0.zip"
+  "notes": "Nâng cấp lớn v2.2.0 — Tích hợp Thư viện Giọng Đọc Siêu Thực OmniVoice AI & Khắc phục triệt để lỗi Edge TTS:\n- Tích hợp thư viện giọng đọc OmniVoice AI (k2-fsa/OmniVoice) làm bộ giọng mặc định mới: hỗ trợ Tự động Clone giọng gốc từng nhân vật trong video, Clone từ file giọng mẫu (.wav/.mp3) và Thiết kế giọng AI đa sắc thái (Nam trầm điện ảnh, Nữ trẻ trung, Thiếu nhi, Người già, ASMR...) với cơ chế khóa đồng nhất màu giọng xuyên suốt video.\n- Tối ưu GPU VRAM thấp (chạy mượt chỉ ~1.2GB VRAM trên GTX 1060 3GB, tự động giải phóng VRAM trước bước xuất video).\n- Khắc phục triệt để lỗi 'edge_tts.exceptions.NoAudioReceived': tự động lọc câu chỉ có dấu câu/ký hiệu, hạ tham số pitch/rate theo tầng khi máy chủ Edge từ chối, không bao giờ làm sập tiến trình xuất video.\n- Lưu ý: Để sử dụng thư viện OmniVoice AI mới, vui lòng cài đặt bộ cài đặt VideoDubber_v2.2.0_Setup.exe mới nhất (các máy cũ chưa cài lại vẫn tự động chạy ổn định bằng Edge TTS đã sửa lỗi).",
+  "hotpatch_url": "https://github.com/bescuong/video-dubber/releases/download/v2.2.0/VideoDubber_HotPatch_v2.2.0.zip"
 }
