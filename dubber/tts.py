@@ -55,9 +55,16 @@ def _sync_drm_clock_once(force: bool = False):
     if _drm_synced and not force:
         return
     try:
+        import ssl
         import urllib.request
         from edge_tts.drm import DRM
-        with urllib.request.urlopen("https://www.microsoft.com", timeout=4) as r:
+        ctx = None
+        try:
+            import certifi
+            ctx = ssl.create_default_context(cafile=certifi.where())
+        except Exception:
+            ctx = None
+        with urllib.request.urlopen("https://www.microsoft.com", timeout=4, context=ctx) as r:
             srv_date = r.headers.get("Date")
             if srv_date:
                 srv_ts = DRM.parse_rfc2616_date(srv_date)

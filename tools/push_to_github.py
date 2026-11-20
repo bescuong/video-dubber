@@ -29,6 +29,7 @@ TRACKED_FILES = [
     "VideoDubber.spec",
     "installer.iss",
     "Chay_ung_dung.bat",
+    "Cap_Nhat_Nhanh.bat",
     "Dong_goi_ung_dung.bat",
     "Day_code_len_GitHub.bat",
     "HD_CAU_HINH_FIREBASE.md",
@@ -191,35 +192,48 @@ def publish_release(token: str, version: str, notes: str):
             payload={"name": f"Video Dubber Studio v{version}", "body": notes},
         )
 
+    def _upload_asset(fname: str, raw_bytes: bytes, ctype: str) -> str:
+        for a in rel.get("assets", []):
+            if a.get("name") == fname:
+                _gh_api(token, f"/repos/{REPO}/releases/assets/{a['id']}", method="DELETE")
+        upload_base = rel["upload_url"].split("{")[0]
+        up_url = f"{upload_base}?name={urllib.parse.quote(fname)}"
+        parsed = urllib.parse.urlparse(up_url)
+        conn = http.client.HTTPSConnection(parsed.netloc, timeout=60)
+        conn.putrequest("POST", f"{parsed.path}?{parsed.query}")
+        conn.putheader("Authorization", f"Bearer {token}")
+        conn.putheader("User-Agent", "VideoDubber-Publisher")
+        conn.putheader("Accept", "application/vnd.github+json")
+        conn.putheader("Content-Type", ctype)
+        conn.putheader("Content-Length", str(len(raw_bytes)))
+        conn.endheaders()
+        conn.send(raw_bytes)
+        resp = conn.getresponse()
+        body = resp.read().decode("utf-8", errors="ignore")
+        conn.close()
+        if resp.status not in (200, 201):
+            raise RuntimeError(f"Asset upload failed ({resp.status}): {body[:300]}")
+        return json.loads(body)["browser_download_url"]
+
     asset_name = f"VideoDubber_HotPatch_v{version}.zip"
-    for a in rel.get("assets", []):
-        if a.get("name") == asset_name:
-            _gh_api(token, f"/repos/{REPO}/releases/assets/{a['id']}", method="DELETE")
-
     zip_bytes = build_hotpatch_zip(version)
-    upload_base = rel["upload_url"].split("{")[0]
-    up_url = f"{upload_base}?name={urllib.parse.quote(asset_name)}"
-    parsed = urllib.parse.urlparse(up_url)
+    patch_dl_url = _upload_asset(asset_name, zip_bytes, "application/zip")
 
-    conn = http.client.HTTPSConnection(parsed.netloc, timeout=60)
-    conn.putrequest("POST", f"{parsed.path}?{parsed.query}")
-    conn.putheader("Authorization", f"Bearer {token}")
-    conn.putheader("User-Agent", "VideoDubber-Publisher")
-    conn.putheader("Accept", "application/vnd.github+json")
-    conn.putheader("Content-Type", "application/zip")
-    conn.putheader("Content-Length", str(len(zip_bytes)))
-    conn.endheaders()
-    conn.send(zip_bytes)
-    resp = conn.getresponse()
-    body = resp.read().decode("utf-8", errors="ignore")
-    conn.close()
-    if resp.status not in (200, 201):
-        raise RuntimeError(f"Asset upload failed ({resp.status}): {body[:300]}")
+    helper_bat = ROOT / "Cap_Nhat_Nhanh.bat"
+    if helper_bat.is_file():
+        bat_bytes = helper_bat.read_bytes()
+        bat_url = _upload_asset("Cap_Nhat_Nhanh.bat", bat_bytes, "application/octet-stream")
+        print(f"[GitHub] Quick Updater Script: {bat_url}")
+        # Also upload zipped version for easy Zalo/Messenger sharing
+        zbuf = io.BytesIO()
+        with zipfile.ZipFile(zbuf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.write(helper_bat, "Cap_Nhat_Nhanh.bat")
+        z_url = _upload_asset("Cap_Nhat_Nhanh_VideoDubber.zip", zbuf.getvalue(), "application/zip")
+        print(f"[GitHub] Zalo-Ready Quick Updater Zip: {z_url}")
 
-    up_data = json.loads(body)
     print(f"[GitHub] Published Release {tag}: {rel['html_url']}")
-    print(f"[GitHub] HotPatch Asset ({len(zip_bytes)//1024} KB): {up_data['browser_download_url']}")
-    return rel["html_url"], up_data["browser_download_url"]
+    print(f"[GitHub] HotPatch Asset ({len(zip_bytes)//1024} KB): {patch_dl_url}")
+    return rel["html_url"], patch_dl_url
 
 
 def main():

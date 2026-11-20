@@ -65,6 +65,7 @@ datas += collect_data_files('edge_tts')
 datas += collect_data_files('faster_whisper')
 datas += collect_data_files('omnivoice')
 datas += collect_data_files('accelerate')
+datas += collect_data_files('certifi')
 
 # Explicitly bundle torch._dynamo.polyfills to prevent missing dynamic polyfill modules (copy.py, heapq.py, etc.)
 torch_polyfills = os.path.join(base_dir, '.venv', 'Lib', 'site-packages', 'torch', '_dynamo', 'polyfills')
@@ -138,6 +139,7 @@ hiddenimports = [
     'pydub.silence',
     'audioop',
     'safetensors',
+    'certifi',
     'sentencepiece',
     'edge_tts',
     'librosa',

@@ -5,6 +5,7 @@ import json
 import os
 import re
 import shutil
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -52,6 +53,53 @@ def get_update_repo() -> str:
     return HARDCODED_GITHUB_REPO
 
 
+def _open_https_resilient(url: str, headers: dict, timeout: int = 15):
+    """Open HTTPS URL resiliently across fresh Windows installs & Antivirus TLS proxies:
+    1st: Combined certifi Mozilla CA bundle + Windows System Root Store.
+    2nd: Default system SSLContext.
+    3rd: Only for official GitHub release domains (`github.com` / `githubusercontent.com`),
+         fallback if local Windows Root CA store is broken or intercepted by Antivirus.
+    """
+    contexts = []
+    try:
+        import certifi
+        ctx_certifi = ssl.create_default_context(cafile=certifi.where())
+        try:
+            ctx_certifi.load_default_certs()
+        except Exception:
+            pass
+        contexts.append(ctx_certifi)
+    except Exception:
+        pass
+
+    contexts.append(ssl.create_default_context())
+
+    host = (urllib.parse.urlparse(url).hostname or "").lower()
+    is_github_host = (
+        host in ("api.github.com", "github.com", "raw.githubusercontent.com")
+        or host.endswith(".githubusercontent.com")
+    )
+    if is_github_host:
+        ctx_unverified = ssl._create_unverified_context()
+        contexts.append(ctx_unverified)
+
+    last_err: Exception | None = None
+    for idx, ctx in enumerate(contexts):
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            return urllib.request.urlopen(req, timeout=timeout, context=ctx)
+        except urllib.error.HTTPError:
+            raise
+        except Exception as e:
+            last_err = e
+            err_s = str(e).upper()
+            # Only retry next context if it's an SSL certificate error
+            if "SSL" not in err_s and "CERTIFICATE" not in err_s and idx < len(contexts) - 1:
+                raise
+            continue
+    raise last_err if last_err else RuntimeError("HTTPS connection failed")
+
+
 # =============================================================================
 # GITHUB RELEASE CHECKER
 # =============================================================================
@@ -68,10 +116,10 @@ def check_for_updates(current_version: str) -> dict:
         "User-Agent": "VideoDubber-Updater",
     }
 
+    api_err = ""
     rel_url = f"https://api.github.com/repos/{repo}/releases/latest"
     try:
-        req = urllib.request.Request(rel_url, headers=headers)
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with _open_https_resilient(rel_url, headers=headers, timeout=12) as resp:
             data = json.loads(resp.read().decode("utf-8"))
             tag = data.get("tag_name", "").lstrip("vV") or current_version
             notes = data.get("body", "") or "Cải thiện chất lượng lồng tiếng, phụ đề và hiệu năng."
@@ -118,31 +166,14 @@ def check_for_updates(current_version: str) -> dict:
             }
     except urllib.error.HTTPError as e:
         if e.code != 404:
-            return {
-                "has_update": False,
-                "latest_version": current_version,
-                "notes": "",
-                "mode": "browser",
-                "files": [],
-                "html_url": f"https://github.com/{repo}/releases",
-                "error": f"Không thể kiểm tra GitHub ({e.code}): {e.reason}",
-            }
+            api_err = f"Không thể kiểm tra GitHub ({e.code}): {e.reason}"
     except Exception as e:
-        return {
-            "has_update": False,
-            "latest_version": current_version,
-            "notes": "",
-            "mode": "browser",
-            "files": [],
-            "html_url": f"https://github.com/{repo}/releases",
-            "error": f"Lỗi kết nối khi kiểm tra cập nhật: {e}",
-        }
+        api_err = f"Lỗi kết nối khi kiểm tra cập nhật: {e}"
 
-    # Fallback: raw version.json on main branch
+    # Fallback: raw version.json on main branch (immune to GitHub REST API 60 req/hr IP rate limit)
     v_url = f"https://raw.githubusercontent.com/{repo}/main/version.json"
     try:
-        req = urllib.request.Request(v_url, headers={"User-Agent": "VideoDubber-Updater"})
-        with urllib.request.urlopen(req, timeout=8) as resp:
+        with _open_https_resilient(v_url, headers={"User-Agent": "VideoDubber-Updater"}, timeout=10) as resp:
             vdata = json.loads(resp.read().decode("utf-8"))
             ver = str(vdata.get("version", current_version)).lstrip("vV")
             dl = vdata.get("hotpatch_url") or vdata.get("download_url", "")
@@ -161,8 +192,20 @@ def check_for_updates(current_version: str) -> dict:
                 "html_url": f"https://github.com/{repo}/releases",
                 "error": "",
             }
-    except Exception:
-        pass
+    except Exception as e2:
+        if not api_err:
+            api_err = f"Lỗi kết nối khi kiểm tra cập nhật: {e2}"
+
+    if api_err:
+        return {
+            "has_update": False,
+            "latest_version": current_version,
+            "notes": "",
+            "mode": "browser",
+            "files": [],
+            "html_url": f"https://github.com/{repo}/releases",
+            "error": api_err,
+        }
 
     return {
         "has_update": False,
@@ -216,8 +259,7 @@ class _DownloadAndApplyWorker(QThread):
                     self.done_sig.emit(False, self.mode, "Đã hủy tải bản cập nhật.")
                     return
                 dest = stage_dir / f_info["name"]
-                req = urllib.request.Request(f_info["url"], headers={"User-Agent": "VideoDubber-Updater"})
-                with urllib.request.urlopen(req, timeout=45) as resp:
+                with _open_https_resilient(f_info["url"], headers={"User-Agent": "VideoDubber-Updater"}, timeout=45) as resp:
                     clen = int(resp.headers.get("Content-Length", "0") or 0)
                     if total_expected == 0:
                         total_expected = clen

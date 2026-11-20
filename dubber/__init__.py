@@ -46,7 +46,6 @@ def _setup_windows_dlls():
             os.path.join(sys._MEIPASS, "ctranslate2"),
         ])
 
-    # Virtualenv / site-packages locations
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     venv_sp = os.path.join(repo_root, ".venv", "Lib", "site-packages")
     dirs.extend([
@@ -86,4 +85,31 @@ def _setup_windows_dlls():
         os.environ["PATH"] = os.pathsep.join(prepend_parts) + os.pathsep + os.environ.get("PATH", "")
 
 
+def _setup_ssl_certificates():
+    """Configure bundled Mozilla Root CA bundle (certifi) so urllib/OpenSSL/huggingface_hub
+    never fail with CERTIFICATE_VERIFY_FAILED on fresh Windows 10/11 installations."""
+    try:
+        import certifi
+        ca = certifi.where()
+        if ca and os.path.isfile(ca):
+            os.environ.setdefault("SSL_CERT_FILE", ca)
+            os.environ.setdefault("REQUESTS_CA_BUNDLE", ca)
+            return
+    except Exception:
+        pass
+
+    for base in (
+        os.path.dirname(sys.executable),
+        os.path.join(os.path.dirname(sys.executable), "_internal"),
+        getattr(sys, "_MEIPASS", ""),
+    ):
+        if base:
+            cand = os.path.join(base, "certifi", "cacert.pem")
+            if os.path.isfile(cand):
+                os.environ.setdefault("SSL_CERT_FILE", cand)
+                os.environ.setdefault("REQUESTS_CA_BUNDLE", cand)
+                return
+
+
 _setup_windows_dlls()
+_setup_ssl_certificates()

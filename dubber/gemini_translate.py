@@ -4,11 +4,26 @@ from __future__ import annotations
 import base64
 import json
 import re
+import ssl
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Dict, List, Optional, Tuple
+
+
+def _build_ssl_context() -> ssl.SSLContext:
+    """Build SSLContext backed by certifi CA bundle + Windows Root Store so HTTPS never fails on fresh Windows."""
+    try:
+        import certifi
+        ctx = ssl.create_default_context(cafile=certifi.where())
+        try:
+            ctx.load_default_certs()
+        except Exception:
+            pass
+        return ctx
+    except Exception:
+        return ssl.create_default_context()
 
 
 # =============================================================================
@@ -158,7 +173,7 @@ def resolve_ordered_models(api_key: str, force_refresh: bool = False) -> List[Tu
     url = f"https://generativelanguage.googleapis.com/v1beta/models?pageSize=100&key={urllib.parse.quote(api_key)}"
     req = urllib.request.Request(url, headers={"User-Agent": "VideoDubber-Studio"})
     try:
-        with urllib.request.urlopen(req, timeout=12) as resp:
+        with urllib.request.urlopen(req, timeout=12, context=_build_ssl_context()) as resp:
             data = json.loads(resp.read().decode("utf-8"))
             for m in data.get("models", []):
                 methods = m.get("supportedGenerationMethods", []) or []
@@ -314,7 +329,7 @@ def _call_gemini_generate(
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with urllib.request.urlopen(req, timeout=timeout, context=_build_ssl_context()) as resp:
             resp_json = json.loads(resp.read().decode("utf-8"))
             candidates = resp_json.get("candidates", [])
             if not candidates:
